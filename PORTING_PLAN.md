@@ -245,3 +245,39 @@ These are host-side C++ logic bugs (not simulated Tensix behavior), so they
 likely reproduce identically on real Blackhole silicon, not just ttsim -
 worth flagging to Tenstorrent independent of this port's timeline.
 
+## 10. I2_S packing: `quantize_i2_s` and `dequantize_row_i2_s` disagree with
+    each other (`ggml/src/ggml-cpu/quants.c`)
+
+Found while implementing Option A dequant-on-upload. Two different bit
+layouts exist in the live (compiled-in) code for the same type:
+
+- `quantize_i2_s`: packs element `i` into `byte[i/4]` at bit position
+  `6-2*(i%4)` - four *consecutive* elements per byte.
+- `dequantize_row_i2_s`: reads `byte[done/4+gp]` and assigns its four 2-bit
+  fields to elements at `done+gp`, `done+32+gp`, `done+64+gp`, `done+96+gp`
+  - four elements *strided by 32 within a 128-element super-block*.
+
+These are genuinely incompatible - round-tripping a tensor through this
+module's own quantize-then-dequantize would scramble it. Checked which one
+is authoritative by reading the real AVX2 inference dot-product,
+`ggml_vec_dot_i2_i8_s_1x1` (same file): it loads 32 packed bytes and extracts
+four 32-wide lanes via `>>6`, `>>4`, `>>2`, `&mask`, multiplying lane k
+against activations `y[k*32 .. k*32+32)` - i.e. the **strided/grouped-by-32
+layout, matching `dequantize_row_i2_s`**, not `quantize_i2_s`. Since this dot
+product is what real BitNet.cpp inference actually runs, it's ground truth
+for what real downloaded I2_S GGUF files contain. `quantize_i2_s` looks like
+a newer/orphaned helper (consistent with Phase-1's finding that the
+`llama-quantize` I2_S code path already looked incomplete) - separately, its
+scale computation also looks broken (`break`s on the first nonzero-magnitude
+element rather than scanning for the true max).
+
+**Consequence**: our dequantizer must mirror `dequantize_row_i2_s`'s
+strided-by-32 indexing (verified against real inference), not
+`quantize_i2_s`'s. Implemented as a small self-contained function in
+`ggml-ttnn.cpp` rather than linking against `ggml-cpu` internals (those
+symbols aren't declared in any shared header, and a device backend taking a
+build dependency on the CPU backend's internals would be architecturally
+wrong) - cross-checked against the real `quantize_i2_s`/`dequantize_row_i2_s`
+symbols from a standalone test harness that links `ggml-cpu` directly, not
+from the backend itself.
+
