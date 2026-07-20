@@ -196,9 +196,52 @@ added there — not off the outer, unused `src/CMakeLists.txt` variable.
    CPU I2_S reference kernel (`ggml_vec_dot_i2_i8_s`) bit-for-bit-ish; grow to
    one block, then a few layers, then a minimal end-to-end smoke test.
 
-## Open questions for you
+## Decisions made
 
-- OK to proceed with this I2_S-first / TL1-TL2-deferred sequencing, or do you
-  want TL1/TL2 in scope from the start?
-- Any objection to the `ggml-tt-metalium` naming, or a preference?
+- I2_S-first / TL1-TL2-deferred sequencing: confirmed.
+- Backend naming: `ggml-ttnn` (CMake target/dir, matching the literal
+  `-DGGML_TTNN=ON` requirement) with description string "TT-Metalium
+  (TTNN)"/"TT_Metalium" in device/buffer-type names.
+
+## 9. Two upstream tt-metal bugs found while building the DRAM buffer type
+
+Both confirmed with minimal repros using only tt-metal's own API, no ggml or
+BitNet code involved - see `ggml-ttnn.cpp` history for the repro shape.
+
+1. **Host-pointer bug**: `SDMeshCommandQueue::write_shard_to_device`
+   (`tt_metal/distributed/sd_mesh_command_queue.cpp`, slow dispatch - required
+   under ttsim per `TTSIM.md`) does
+   `payload = Span(src + region.offset, region.size)`, adding the *device*
+   region offset to the *host* source pointer too, instead of reading the
+   payload from the start of the caller's buffer. The matching read path does
+   not have this bug (asymmetric implementation).
+2. **Interior-region bug**, independent of (1): a `BufferRegion` write or read
+   that is "interior" - `offset > 0 AND offset+size < buffer.size()` - lands
+   at device offset 0 instead of the requested offset. Only regions anchored
+   at the very start or spanning to the exact end of a buffer are safe. Not a
+   page-size artifact - reproduced identically at page_size 1, 2, 4, 8, 16, 32.
+
+Together these rule out the "one shared MeshBuffer, tensors placed at
+ggml-computed sub-offsets" design that CUDA/Metal/RPC all use for their ggml
+buffer types. **Resolution**: every ggml tensor gets its own dedicated
+MeshBuffer (`init_tensor()` allocates it once ggml assigns `tensor->data`),
+and every tt-metal-facing access is always the *entire* buffer (offset 0,
+full size) - confirmed safe under both bugs. Partial ggml-side
+set/get/memset calls become a host-side read-modify-write over the whole
+buffer. `tensor->data` is a synthetic pointer into a host-only "shadow"
+allocation (`posix_memalign`, 32-byte aligned - plain `malloc` is only
+16-byte aligned on x86_64 and silently corrupted ggml's own tallocr
+bookkeeping) used purely as a unique per-tensor lookup key, never
+dereferenced for real data.
+
+Known follow-up gap: tensor **views** (`view_src != NULL`) aren't supported
+yet by this scheme (a view would need to reuse its parent's buffer at a
+possibly-interior offset, hitting bug 2 again) - `init_tensor` currently
+`GGML_ASSERT`s this hasn't happened. Not exercised by weight loading; will
+need a real solution before KV-cache or any op that creates views is
+offloaded.
+
+These are host-side C++ logic bugs (not simulated Tensix behavior), so they
+likely reproduce identically on real Blackhole silicon, not just ttsim -
+worth flagging to Tenstorrent independent of this port's timeline.
 
