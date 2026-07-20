@@ -281,3 +281,41 @@ wrong) - cross-checked against the real `quantize_i2_s`/`dequantize_row_i2_s`
 symbols from a standalone test harness that links `ggml-cpu` directly, not
 from the backend itself.
 
+## 11. First op offload: `GGML_OP_MUL_MAT` (I2_S x F32) via stock `ttnn::matmul`
+
+`supports_op()` now accepts `MUL_MAT` when `src0` is `I2_S`, `src1` and `dst`
+are `F32`. `graph_compute()` handles it by reading the already-on-device
+dequantized bf16 weight and the F32 activation back to host, wrapping both as
+fresh `ttnn::Tensor`s (`Tensor::from_vector` + `.to_device()`), and calling
+`ttnn::matmul(activation, weight, transpose_a=false, transpose_b=true)` -
+matching ggml's `mul_mat` convention (`dst = act @ weight^T`, i.e. nn.Linear
+semantics; derived from ggml's `ne[0]`-is-fastest-dim memory layout, not
+assumed). Result comes back via `to_vector<float>()` and is written to dst.
+
+This round-trips already-on-device weight data through the host on every
+call - this backend doesn't yet store `ttnn::Tensor` natively in its buffer
+type (still raw `MeshBuffer`, see sec 8-9), so op execution stages through
+host memory. Correct, not fast; worth revisiting once the buffer type is
+redesigned around `ttnn::Tensor` directly.
+
+**Verified under ttsim**: a 64x128 ternary weight times a 3x128 F32
+activation, run through the real `graph_compute()` path (built as a genuine
+`ggml_cgraph` via `ggml_build_forward_expand` + `ggml_backend_graph_compute`,
+not called directly), matches a CPU f64 reference matmul to within bf16
+precision (max abs error ~0.03, 0 large diffs) across all 192 output
+elements.
+
+**Third tt-metal bug found**: destroying a `MeshDevice` after any real op has
+populated tt-metal's internal program cache crashes inside
+`GraphTracker::track_deallocate_cb` during `~MeshDeviceImpl()`'s teardown of
+cached `MeshWorkload`/`Program` objects - reproduced with a plain
+`ttnn::matmul` call, no ggml involved. Calling `MeshDevice::close()` first
+does *not* prevent it (confirmed by instrumenting an `atexit` hook ordered,
+via a second static-local initializer, to run strictly before the singleton's
+own destructor - `close()` completes successfully, and the crash still
+happens moments later in the destructor). Resolution: `mesh_device` is now
+allocated via `new` and intentionally never destroyed - the process is
+exiting either way, so leaking it sidesteps the bug entirely. Same category
+of host-side C++ logic as bugs 1-2 (sec 8), so worth reporting upstream
+alongside them; not filed yet.
+
