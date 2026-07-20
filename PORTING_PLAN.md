@@ -147,6 +147,14 @@ custom Metalium kernel.
   `LD_LIBRARY_PATH=$TT_METAL_HOME/build_Release/lib` for `libtt_metal.so`.
 - `~/stage_bitnet/Bitnet-TT/sim/` has `libttsim_bh.so` + `soc_descriptor.yaml`
   already in place.
+- Second gotcha found while bringing up the `ggml-ttnn` backend: `TT_METAL_HOME`
+  is a convention used by tt-metal's own scripts/docs, but the runtime library
+  itself (`RunTimeOptions`, `tt_metal/llrt/rtoptions.cpp`) looks for
+  `TT_METAL_RUNTIME_ROOT` (or falls back to cwd, or a package-install path).
+  A binary not run from the tt-metal repo root - i.e. any real consumer of
+  this backend, sim or silicon - needs `TT_METAL_RUNTIME_ROOT=$TT_METAL_HOME`
+  set explicitly, or it fails fast with `TT_FATAL: Root Directory is not set.`
+  Applies identically on silicon; not a sim-specific fix.
 
 ## 7. Build system gap (resolved by re-checking against the now-corrected submodule)
 
