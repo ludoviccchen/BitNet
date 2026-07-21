@@ -45,3 +45,8 @@ poetry.toml
 
 build/
 logs/
+
+
+# Tenstorrent
+
+generated/

@@ -319,3 +319,61 @@ exiting either way, so leaking it sidesteps the bug entirely. Same category
 of host-side C++ logic as bugs 1-2 (sec 8), so worth reporting upstream
 alongside them; not filed yet.
 
+## 12. First full-model offload attempt under ttsim: fixed one scheduler bug,
+    confirmed the view limitation (sec 9) is a hard blocker for real inference
+
+Attempted `llama-cli -m <official I2_S GGUF> -ngl 99 -dev TT_METALIUM0` under
+ttsim, using the official `microsoft/BitNet-b1.58-2B-4T-gguf` (already
+quantized, downloaded directly - `llama-quantize` in this branch has no
+`I2_S` entry in its `QUANT_OPTIONS` table, `tools/quantize/quantize.cpp:34-73`,
+despite `LLAMA_FTYPE_MOSTLY_I2_S` existing in `llama.h`; matches the
+Phase-1 finding that the `llama-quantize` I2_S path looks incomplete -
+producing I2_S GGUFs locally isn't possible with this branch's quantize
+tool, only pre-quantized official GGUFs work).
+
+**Bug found and fixed**: `ggml_backend_sched_backend_from_buffer`
+(`ggml-backend.cpp:845`) calls `supports_op()` even for pre-allocated leaf
+tensors (weights) already sitting in a backend's buffer, passing the tensor
+itself as `op` - for a weight tensor this means `op->op == GGML_OP_NONE`.
+`ggml_backend_ttnn_device_supports_op` only ever returned `true` for
+`MUL_MAT`, so this aborted immediately on the first weight tensor
+(`pre-allocated tensor (blk.0.attn_q.weight) ... cannot run the operation
+(NONE)`). Fixed by returning `true` for `GGML_OP_NONE` specifically.
+**Deliberately did not** extend this to `VIEW`/`RESHAPE`/`TRANSPOSE`/
+`PERMUTE` even though `graph_compute()`'s switch already tolerates them
+(sec 11's code) - those are real computed nodes, and telling the scheduler
+this device "supports" them would make it place them on our buffer type,
+which cannot hold a view at all (next paragraph).
+
+**Confirmed blocker, not a quick fix**: with the leaf-tensor bug fixed, KV
+cache placement crashed next (`cache_k_l0 (view) ... cannot run the
+operation (SET_ROWS)`) - solved for now with `-nkvo` (forces KV cache to
+CPU, an existing llama.cpp flag, no backend change needed). With `-nkvo`
+too, the *next* crash is the real ceiling: during `ggml_gallocr_alloc_graph`
+for the first decode, some node with `tensor->view_src != NULL` gets
+allocated into the TT_Metalium buffer and hits the buffer type's own guard
+(sec 9's `GGML_ASSERT(tensor->view_src == NULL ...)`). Root cause: once a
+`MUL_MAT`'s F32 output lives in this backend's buffer (because the op ran
+on this device), every real transformer layer immediately follows that
+matmul with a reshape/permute (splitting into attention heads, etc.) -
+i.e. a view of that output - and the buffer type categorically cannot
+allocate a view (sec 9: one whole `MeshBuffer` per tensor, no interior
+offsets, because of the two upstream tt-metal bugs). This reproduces with
+the plain Q projection of layer 0, so it is not model- or layer-specific:
+**no real transformer block can be offloaded end to end today, only the
+previously-validated standalone `MUL_MAT` (sec 11) works** - that test
+never chained a reshape/permute after the matmul, which is why it didn't
+hit this.
+
+Sanity check: the same GGUF with `-ngl 0` (no offload, CPU only) completed
+cleanly end to end (54.2 t/s prompt, 14.8 t/s generation on 2 threads),
+confirming the model file, the build, and everything except the TTNN
+offload path itself are healthy.
+
+**Consequence**: closing this gap needs the buffer-type redesign already
+flagged as future work in sec 9 (real view support, or an alternative like
+copying view-producing ops' inputs back to a CPU-owned staging buffer
+before/after the matmul) - not something to patch around locally. Until
+then, `-ngl`/`-dev TT_METALIUM0` on a real model will always hit this same
+assert on the first attention block, regardless of model size.
+
