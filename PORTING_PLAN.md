@@ -437,3 +437,51 @@ path alongside/instead of Option A, generalize past the single-N-tile
 scope, and validate on a size that matches a real model's projection
 dimensions rather than this toy 32x128 case.
 
+## 14. Generalizing sec 13's kernels past a single N-tile: two more tile-index bugs
+
+Extended the ternary matmul kernels to handle arbitrary Mt/Kt/Nt (not just
+Mt=Nt=1, Kt=4), tested at M=64/K=256/N=64 (Mt=2, 2 K-superblocks/row, Nt=2).
+The reader's weight-unpack indexing generalizes cleanly: row `row`'s packed
+data starts at byte `row*(K/4)`, and K-tile `kt` sits at super-block `kt/4`,
+lane `kt%4` within that row - both already correct from sec 13, confirmed
+with a dense (all-positions-nonzero) weight pattern against a constant
+activation matching exactly (0 error, not just within tolerance).
+
+Two *new* bugs surfaced once Mt and Nt were no longer both 1 - both are
+"formula only valid when a tile count is 1" bugs, invisible until now for
+exactly that reason:
+
+1. **Writer**: our output is `[N, M]` (N outer, M inner - sec 11/13), so the
+   DRAM page index must be `n*Mt + m` (N-tile major) to match how the
+   host's `untilize_nfaces(N, M)` expects tiles laid out. The kernel (copied
+   from the stock example, which assumes `[M, N]`) used `m*Nt + n`. With
+   Mt=Nt=1 both formulas give 0; at Mt=2/Nt=2 they diverge and two tiles
+   land swapped.
+2. **Reader**: the activation tensor is `[K, M]` (transposed on upload, per
+   sec 13), so its tile grid is K-tile-major: index `kt*Mt + mt`. The reader
+   used `mt*Kt + kt` (right for an `[M, K]`-shaped tensor, wrong for
+   `[K, M]`). Again, `mt*Kt+kt == kt*Mt+mt` whenever Mt=1, which is exactly
+   why sec 13's Mt=1 validation didn't catch it.
+
+Both found the same way as every other bug this session: isolate with a
+sparse, hand-picked probe (three single nonzero weights placed to
+independently exercise nt=1, and a second super-block/lane, against a
+constant activation) before trusting the dense random-pattern test. The
+probe passed exactly (0 error) even before either fix - it happened to
+only exercise positions where the two buggy formulas coincide with the
+correct ones - and only failed once widened to hit every (mt, nt) pair,
+which is what actually caught bug 1. Bug 2 stayed hidden until switching to
+dense weights + non-constant activation with Mt=2, since a constant
+activation is insensitive to which activation tile is fetched.
+
+**Verified under ttsim**: dense random weight pattern, sinusoidal
+activation, full Mt=2/Kt=8/Nt=2 grid - matches CPU f64 reference to within
+~0.07 absolute error across all 4096 outputs (same bf16-cancellation
+tolerance as sec 13, scaled up slightly for twice the K-dimension terms).
+
+Remaining scope limit (documented in the kernel directory's README): the
+whole packed weight blob is still read once into a scratch L1 CB and kept
+resident for the kernel's duration. Fine for correctness at these sizes;
+does not scale to real model weight matrices without chunked/streamed
+reads - not attempted here.
+
