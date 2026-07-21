@@ -377,3 +377,63 @@ before/after the matmul) - not something to patch around locally. Until
 then, `-ngl`/`-dev TT_METALIUM0` on a real model will always hit this same
 assert on the first attention block, regardless of model size.
 
+## 13. Option B: custom ternary matmul kernels (reader/compute/writer triad)
+
+First cut at the "true 1.58-bit path" from the original task brief: packed
+2-bit weights consumed directly, no dequantize-on-upload. Lives at
+`ggml/src/ggml-ttnn/kernels/ternary_matmul/` (see that directory's own
+README for the file-by-file breakdown) - **not yet wired into
+`ggml-ttnn.cpp`'s `supports_op`/`graph_compute`**, which still uses Option A
+(`ttnn::matmul` on dequantized bf16). This is a validated kernel triad, not
+yet an integrated backend path.
+
+**Design**: only the reader kernel is ternary-specific. It reads the packed
+I2_S bytes from DRAM and unpacks them *on-device* directly into the 32x32
+tile-face layout the FPU's `matmul_tiles` expects (four 16x16 faces,
+face0->face1->face2->face3, row-major within each face - verified against
+`tech_reports/tensor_layouts/tensor_layouts.md`, not guessed), using the
+strided-by-32-in-128 decode verified in sec 10. The compute and writer
+kernels are unmodified copies of the stock
+`matmul_single_core` example's `mm.cpp`/`writer_single_core_mm.cpp`. Since
+ternary weight values are exactly {-1, 0, +1}, the FPU's per-element
+"multiply" against those values is bit-exact to a conditional
+negate/pass-through/zero of the activation - it already *is* an add/sub
+accumulation, just executed on the FPU's existing multiply-accumulate
+datapath rather than a hand-rolled SFPU one. The device outputs the
+*unscaled* dot product; the per-tensor weight scale is applied by the
+caller afterward, not per-element in-kernel.
+
+Scope: single N-tile weight (N=32) - the packed I2_S format stores one
+scale for the whole tensor, not per N-tile, so the packed blob for one
+N-tile is treated as a single DRAM page, read once per M-tile row and kept
+resident in a scratch L1 CB for the whole Kt loop. Multi-N-tile support
+needs the scale handled across tiles first, not attempted here.
+
+**Verified under ttsim**, via a standalone TT-Metalium `Program`/`Kernel`
+dispatch that bypasses TT-NN entirely (unlike Option A): a 32x128 ternary
+weight against a 32x128 activation matches a CPU f64 reference to within
+~0.05 absolute error across all 1024 output elements. That error is bf16
+rounding under catastrophic cancellation (summing 128 terms of magnitude
+~weight-scale with mixed signs down to a near-zero result amplifies
+relative, though not absolute, error) - same ~0.03 magnitude seen with
+`ttnn::matmul` (Option A) on equivalent data, not a kernel defect. Confirmed
+by isolating a single known nonzero weight against a constant activation
+first (before the full randomized-pattern test), which caught two real bugs
+along the way:
+- The FPU's `matmul_tiles(in0, in1, ...)` computes
+  `dst[i,j] = sum_k tileA[i,k] * tileB[k,j]` with tileA fed by `in0`, tileB
+  by `in1` - so the activation must be uploaded *transposed* (`[K,M]`, not
+  `[M,K]`) to land in tileB's `[k,j]` slots. The output is consequently
+  `[N,M]`-shaped (N outer, M inner) - which happens to already match ggml's
+  own `mul_mat` dst convention (sec 11), so no extra transpose is needed
+  once this is understood correctly.
+- The device intentionally returns the unscaled dot product (see Design
+  above); the first "mismatch" after fixing the transpose was the test
+  forgetting its own stated contract and comparing against the
+  scale-applied reference directly.
+
+**Next steps** (not done here): wire this in as a `supports_op`-selectable
+path alongside/instead of Option A, generalize past the single-N-tile
+scope, and validate on a size that matches a real model's projection
+dimensions rather than this toy 32x128 case.
+
