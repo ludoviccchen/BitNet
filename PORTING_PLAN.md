@@ -485,3 +485,65 @@ resident for the kernel's duration. Fine for correctness at these sizes;
 does not scale to real model weight matrices without chunked/streamed
 reads - not attempted here.
 
+## 15. Option B wired into supports_op/graph_compute, replacing Option A
+
+`ggml-ttnn.cpp`'s `GGML_OP_MUL_MAT` path now dispatches the sec 13/14
+kernel triad directly, superseding Option A's `ttnn::matmul`-on-dequantized-
+bf16 path entirely (not kept alongside it - the two are mutually exclusive
+at the storage level, since Option B needs the weight to *stay* packed on
+device). Concretely:
+
+- The buffer type no longer special-cases I2_S at all: weights are stored
+  packed, byte-for-byte identical to the gguf file, exactly like every
+  other type (`ggml_backend_ttnn_dequantize_i2_s` and the bf16-sized
+  `device_alloc_size` special case are gone - `get_alloc_size` is back to
+  `NULL`, defaulting to `ggml_nbytes`). Simpler than Option A's storage
+  model, not just different: there's no host/device size mismatch left to
+  track anywhere.
+- `compute_mul_mat` reuses the weight tensor's own resident `MeshBuffer`
+  directly as the reader kernel's `TensorAccessor` source (no re-upload -
+  Option B's entire point is that packed weights never leave DRAM as
+  anything but packed bytes). It reads that same buffer back to host once,
+  only to pull out the trailing 4-byte scale (cheap - it's the packed size,
+  not a dequantized one - and safe per sec 9, since it's a whole-buffer
+  read). The activation still has to round-trip through host memory to get
+  transposed and tile-faced (kernel README), same limitation as Option A.
+- `supports_op` and `compute_mul_mat` share one shape-validity check (`K`
+  a multiple of 128, `N`/`M` tile-aligned) so an unsupported shape falls
+  back to CPU via the scheduler instead of hitting an assert.
+- TT-NN is no longer linked at all (`find_package(tt-nn)` / `TTNN::TTNN`
+  removed from `CMakeLists.txt`) - Option B only needs TT-Metalium.
+
+**Bug found while wiring this in** (independent of the sec 13/14 kernels,
+which needed no changes): a real dst-layout transpose bug, caught
+immediately by re-running the sec 13/14 diagnostics through the real
+`ggml_backend_sched`/`graph_compute` path instead of a hand-rolled
+dispatch. ggml's `dst` (`ne=[N,M]`) is row-major **`[M,N]`** in flat bytes
+(`M` outer, `N` inner - `N` is `ne[0]`, the fastest dimension). The kernel
+triad's own tile grid is the opposite way round - the writer lays tiles out
+N-tile-major (page index `n*Mt+m`), so `untilize_nfaces(result_tiled, N,
+M)` reconstructs an **N-outer/M-inner** matrix, the transpose of what
+`dst`'s bytes actually need. An earlier code comment claiming these two
+"[N,M]" labels already matched was simply wrong - one refers to the
+kernel's own tile-grid bookkeeping, the other to ggml's flat byte layout,
+and conflating them silently produced a real bug: with one known nonzero
+weight (row 0) and a constant activation, row 0's value leaked into
+unrelated output rows once read back through a real ggml tensor, while the
+raw pre-untilize device tile data was already provably correct - proof the
+bug was in this final host-side relayout, not the kernel. Fixed by
+transposing explicitly (`out_host[m*N+n] = result[n*M+m] * scale`) while
+applying the per-tensor scale in the same pass.
+
+**Re-verified under ttsim** through the real dispatch path
+(`ggml_backend_dev_supports_op` + `ggml_backend_graph_compute`, not a
+hand-built `Program`): both the single-nonzero-weight diagnostic and the
+dense random-pattern tests from sec 13/14 (K=128/N=32/M=32 and
+K=256/N=64/M=64) now match their previously-validated results exactly
+(max abs error 0.052 and 0.070 respectively - identical to the standalone
+numbers), confirming the fix is complete and the kernels themselves were
+never the problem.
+
+**Still not attempted**: the view-support gap (sec 12) remains the real
+blocker for a full model - this wiring only changes *how* the standalone
+matmul executes, not whether a full transformer block can run end to end.
+
