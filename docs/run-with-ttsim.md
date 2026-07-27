@@ -1,78 +1,82 @@
-# Faire tourner BitNet-TT avec le simulateur ttsim
+# Running BitNet-TT with the ttsim simulator
 
-Ce guide explique comment builder et exécuter ce dépôt en utilisant
-[ttsim](https://github.com/tenstorrent/ttsim), le simulateur fonctionnel
-Tenstorrent, au lieu d'un vrai chip Blackhole/Wormhole. Il documente l'état
-du portage tel que décrit dans [`PORTING_PLAN.md`](../PORTING_PLAN.md), qui
-reste la référence pour le détail technique et les limitations connues.
+This guide explains how to build and run this repo using
+[ttsim](https://github.com/tenstorrent/ttsim), Tenstorrent's functional
+simulator, instead of a real Blackhole/Wormhole chip. It documents the
+state of the port as described in [`PORTING_PLAN.md`](../PORTING_PLAN.md),
+which remains the reference for technical detail and known limitations.
 
-## 0. Où en est le portage
+## 0. Where the port stands
 
-Le backend `ggml-ttnn` (répertoire
+The `ggml-ttnn` backend (directory
 [`3rdparty/llama.cpp/ggml/src/ggml-ttnn/`](../3rdparty/llama.cpp/ggml/src/ggml-ttnn/))
-sait aujourd'hui :
+currently:
 
-- ouvrir un device TT-Metalium réel (silicium ou ttsim, choisi par
-  `TT_METAL_SIMULATOR`, jamais testé dans le code du backend) ;
-- allouer un buffer DRAM par tenseur et y uploader des poids `I2_S`
-  (dé-quantifiés en bf16 à l'upload, "Option A") ;
-- offloader **uniquement `GGML_OP_MUL_MAT` quand `src0` est `I2_S` et
-  `src1`/`dst` sont `F32`**, via `ttnn::matmul`.
+- opens a real TT-Metalium device (silicon or ttsim, chosen via
+  `TT_METAL_SIMULATOR`, never branched on in the backend's own code);
+- allocates one DRAM buffer per tensor (weights, activations, KV-cache...)
+  and stores data **as-is**, with no type conversion - including `I2_S`
+  weights, packed byte-for-byte identical to the GGUF file;
+- offloads `GGML_OP_MUL_MAT` when `src0` is `I2_S` and `src1`/`dst` are
+  `F32`, via a custom trio of TT-Metalium kernels (reader/compute/writer,
+  "Option B") that unpacks the ternary weights *on-device*, without going
+  through TT-NN or a bf16 dequantize-on-upload step;
+- offloads `GGML_OP_SET_ROWS` (the KV-cache write) and the pure view ops
+  (`VIEW`/`RESHAPE`/`TRANSPOSE`/`PERMUTE`, e.g. reading the KV-cache back
+  for attention) - which makes a **complete** offload of a real model
+  possible, KV-cache included, with no workaround flag needed.
 
-Tout le reste (RMSNorm, RoPE, softmax, KV-cache, embeddings...) reste sur
-CPU — c'est le comportement normal du graph-splitter de ggml-backend, pas
-une limitation à contourner. N'attends pas un forward pass complet sur
-device : ce qui est validé aujourd'hui, c'est l'offload du mul_mat pour une
-projection isolée.
+Everything else (RMSNorm, RoPE, softmax, embeddings...) stays on CPU - this
+is normal ggml-backend graph-splitter behavior, not a limitation being
+worked around. A full forward pass on a real model works end to end under
+ttsim (section 6) - but this is still a **functional correctness** test, not
+a performance one (ttsim is a functional simulator; see section 7).
 
-## 1. Prérequis
+## 1. Prerequisites
 
-Dans cet environnement, tout est déjà en place (vérifié) :
+In this environment, everything is already in place (verified):
 
-- `TT_METAL_HOME=~/stage_bitnet/Bitnet-TT/tt-metal` — arbre tt-metal
-  prébuild, avec `build_Release/` contenant les configs CMake
-  (`tt-metalium`, `tt-nn`).
+- `TT_METAL_HOME=~/stage_bitnet/Bitnet-TT/tt-metal` - a prebuilt tt-metal
+  tree, with `build_Release/` containing the `tt-metalium` CMake config.
 - `~/stage_bitnet/Bitnet-TT/sim/libttsim_bh.so` +
-  `~/stage_bitnet/Bitnet-TT/sim/soc_descriptor.yaml` (copie de
-  `blackhole_140_arch.yaml`) — le binaire ttsim Blackhole et son descripteur
-  SoC, déjà côte à côte comme ttsim l'exige.
-- SFPI installé (`/opt/tenstorrent/sfpi`).
-- `tt-umd`/`tt-exalens` avec les fixes TTSim (déjà validés : l'exemple
-  `metal_example_add_2_integers_in_riscv` tourne proprement sous ttsim dans
-  cet environnement).
+  `~/stage_bitnet/Bitnet-TT/sim/soc_descriptor.yaml` (a copy of
+  `blackhole_140_arch.yaml`) - the Blackhole ttsim binary and its SoC
+  descriptor, already sitting side by side as ttsim requires.
+- SFPI installed (`/opt/tenstorrent/sfpi`).
+- `tt-umd`/`tt-exalens` with the TTSim fixes (already validated: the
+  `metal_example_add_2_integers_in_riscv` example runs cleanly under ttsim
+  in this environment).
 
-Si tu repars d'un environnement neuf, suis
+If you're starting from a fresh environment, follow
 [`tt_metal/tt-llk/tests/TTSIM.md`](../../tt-metal/tt_metal/tt-llk/tests/TTSIM.md)
-dans le dépôt `tt-metal` pour remettre ça en place.
+in the `tt-metal` repo to set this back up.
 
-## 2. Variables d'environnement
+## 2. Environment variables
 
 ```bash
 export TT_METAL_HOME=~/stage_bitnet/Bitnet-TT/tt-metal
-# Le runtime tt-metal (rtoptions.cpp) ne lit PAS TT_METAL_HOME lui-même :
-# sans ça, tout binaire qui n'est pas lancé depuis la racine du dépôt
-# tt-metal échoue avec "TT_FATAL: Root Directory is not set."
+# The tt-metal runtime (rtoptions.cpp) does NOT read TT_METAL_HOME itself:
+# without this, any binary not launched from the tt-metal repo root fails
+# with "TT_FATAL: Root Directory is not set."
 export TT_METAL_RUNTIME_ROOT=$TT_METAL_HOME
 
 export TT_METAL_SIMULATOR=~/stage_bitnet/Bitnet-TT/sim/libttsim_bh.so
-export TT_METAL_SLOW_DISPATCH_MODE=1     # ttsim ne fait que du slow dispatch
-export TT_METAL_DISABLE_SFPLOADMACRO=1   # SFPLOADMACRO pas implémenté par ttsim
+export TT_METAL_SLOW_DISPATCH_MODE=1     # ttsim only supports slow dispatch
+export TT_METAL_DISABLE_SFPLOADMACRO=1   # SFPLOADMACRO isn't implemented by ttsim
 
-# Nécessaire pour tout binaire lancé hors de l'arbre de build tt-metal
+# Needed for any binary launched outside the tt-metal build tree
 export LD_LIBRARY_PATH=$TT_METAL_HOME/build_Release/lib:$LD_LIBRARY_PATH
 ```
 
-Ces quatre premières variables sont exactement celles utilisées pour
-valider le stack ttsim end-to-end dans cet environnement ; les deux
-suivantes (`RUNTIME_ROOT`, `LD_LIBRARY_PATH`) sont des pièges spécifiques à
-l'exécution *hors* de l'arbre tt-metal (donc pertinents ici, puisque le
-binaire final est `BitNet/build/bin/llama-cli`).
+The first four variables are exactly the ones used to validate the ttsim
+stack end to end in this environment; the last two (`RUNTIME_ROOT`,
+`LD_LIBRARY_PATH`) are pitfalls specific to running *outside* the tt-metal
+tree (relevant here, since the final binary is `BitNet/build/bin/llama-cli`).
 
-## 3. Compiler BitNet avec le backend TTNN
+## 3. Building BitNet with the TTNN backend
 
-Le CMake du dépôt a un flag dédié, `-DGGML_TTNN=ON`, séparé du build CPU
-normal. Reconfigure (le `build/` actuel du dépôt a été généré avec
-`GGML_TTNN=OFF`) :
+The repo's CMake has a dedicated flag, `-DGGML_TTNN=ON`, separate from the
+normal CPU build:
 
 ```bash
 cd ~/stage_bitnet/Bitnet-TT/BitNet
@@ -80,123 +84,174 @@ cmake -B build -S . \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_TTNN=ON \
   -DBITNET_X86_TL2=OFF \
-  -DTT-Metalium_DIR=$TT_METAL_HOME/build_Release/lib/cmake/tt-metalium \
-  -Dtt-nn_DIR=$TT_METAL_HOME/build_Release/lib/cmake/tt-nn \
   -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=ON \
   -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_SERVER=ON
 cmake --build build --target llama-cli -j"$(nproc)"
 ```
 
-Les quatre flags `LLAMA_BUILD_*` sont les mêmes que ceux passés par
-`setup_env.py` pour le build CPU normal — sans eux, `LLAMA_BUILD_TOOLS`
-vaut `OFF` par défaut (le sous-projet `3rdparty/llama.cpp` n'est pas
-"standalone" ici), et `add_subdirectory(tools)` n'est jamais exécuté :
-le target `llama-cli` n'existe tout simplement pas et `cmake --build`
-échoue avec `No rule to make target 'llama-cli'`.
+The four `LLAMA_BUILD_*` flags are the same ones `setup_env.py` passes for
+the normal CPU build - without them, `LLAMA_BUILD_TOOLS` defaults to `OFF`
+(the `3rdparty/llama.cpp` subproject isn't "standalone" here), and
+`add_subdirectory(tools)` never runs: the `llama-cli` target simply doesn't
+exist and `cmake --build` fails with `No rule to make target 'llama-cli'`.
 
-Build vérifié bout en bout dans cet environnement (~1 min avec cache
-compilateur froid) : `llama-cli` compile et link sans erreur avec
-`GGML_TTNN=ON`.
+`3rdparty/llama.cpp/ggml/src/ggml-ttnn/CMakeLists.txt` derives
+`TT-Metalium_DIR` from `TT_METAL_HOME` on its own (so export the section 2
+variables **before** running `cmake -B`) - unlike an earlier version of this
+backend, you no longer need to pass `-DTT-Metalium_DIR=...`/`-Dtt-nn_DIR=...`
+by hand: since the backend now consumes packed ternary weights directly via
+custom kernels ("Option B", see `PORTING_PLAN.md` §13-15), TT-NN isn't
+linked at all anymore, only TT-Metalium is needed. If CMake still picks the
+wrong `tt-metalium-config.cmake` (a second, broken copy with no
+`Metalium.cmake` next to it sits directly under
+`$TT_METAL_HOME/build_Release/`), pass the override explicitly - see
+section 8.
 
-`3rdparty/llama.cpp/ggml/src/ggml-ttnn/CMakeLists.txt` sait déjà déduire ces
-deux chemins depuis `TT_METAL_HOME` (donc exporte les variables de la
-section 2 **avant** de lancer `cmake -B`) — mais seulement si
-`TT-Metalium_DIR`/`tt-nn_DIR` ne sont pas déjà en cache. Il y a un second
-`tt-metalium-config.cmake` cassé (sans `Metalium.cmake` à côté) directement
-sous `$TT_METAL_HOME/build_Release/`, et si une configuration précédente
-l'a trouvé en premier (via `CMAKE_PREFIX_PATH`), il reste figé en cache et
-le fallback interne du script ne le corrige plus. Passer les deux `-D`
-explicitement ci-dessus contourne ça dans tous les cas, y compris en
-reconfigurant un `build/` déjà pollué par une tentative précédente.
+## 4. Verifying the backend loads under ttsim
 
-## 4. Vérifier que le backend se charge sous ttsim
-
-Une fois buildé, `llama-cli` doit énumérer un device `TT_METALIUM0` :
+Once built, `llama-cli` should enumerate a `TT_METALIUM0` device:
 
 ```bash
 ./build/bin/llama-cli --list-devices
 ```
 
-Tu dois voir apparaître un device nommé `TT_METALIUM0` (description
-`TT_Metalium`), à côté du CPU. Si `TT_METAL_SIMULATOR` est bien positionné,
-ce device s'ouvre contre ttsim et non contre du silicium — rien à faire de
-plus côté BitNet, le choix silicium/ttsim est entièrement décidé par
-tt-metal via cette variable.
+You should see a device named `TT_METALIUM0` (description `TT_Metalium`)
+alongside the CPU. If `TT_METAL_SIMULATOR` is set correctly, this device
+opens against ttsim rather than silicon - nothing more to do on the BitNet
+side, the silicon/ttsim choice is entirely decided by tt-metal via that
+variable.
 
-Sortie réelle observée dans cet environnement, variables de la section 2
-exportées :
+Actual output observed in this environment, section 2 variables exported:
 
 ```
 Available devices:
   TT_METALIUM0: Tenstorrent Blackhole (TT-Metalium/TT-NN backend, registration skeleton) (0 MiB, 0 MiB free)
 ```
 
-(le "0 MiB" et "registration skeleton" viennent du fait que
-`ggml_backend_dev_get_memory` n'est pas encore implémenté pour ce
-backend — sans conséquence pour l'énumération ou l'offload.)
+(The "0 MiB" and "registration skeleton" come from
+`ggml_backend_dev_get_memory` not being implemented yet for this backend -
+no consequence for enumeration or offload.)
 
-Si tu obtiens `TT_FATAL: Root Directory is not set.`, c'est
-`TT_METAL_RUNTIME_ROOT` qui manque (section 2).
+If you get `TT_FATAL: Root Directory is not set.`, `TT_METAL_RUNTIME_ROOT`
+is missing (section 2).
 
-## 5. Lancer une inférence avec offload sur ttsim
-
-⚠️ `run_inference.py` force `-ngl 0` en dur — il ne testera **jamais**
-l'offload TTNN tel quel. Pour exercer le backend, invoque `llama-cli`
-directement.
+## 5. Preparing an I2_S model
 
 ```bash
-# Modèle I2_S, ex. téléchargé via setup_env.py comme d'habitude
 python setup_env.py -md models/BitNet-b1.58-2B-4T -q i2_s
+```
 
+On a system with an "externally managed" Python (recent Debian/Ubuntu,
+PEP 668 - `setup_env.py` then fails on
+`pip install 3rdparty/llama.cpp/gguf-py` with
+`error: externally-managed-environment`), create a venv first and install
+dependencies there - `setup_env.py` uses `sys.executable` internally, so
+running it from inside the venv is enough, no script changes needed:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python setup_env.py -md models/BitNet-b1.58-2B-4T -q i2_s
+```
+
+This repo (current branch) can't produce an `I2_S` GGUF locally with its own
+`llama-quantize` (`LLAMA_FTYPE_MOSTLY_I2_S` isn't in the `QUANT_OPTIONS`
+table) - only an already-quantized `I2_S` GGUF (like
+`microsoft/BitNet-b1.58-2B-4T-gguf`, downloaded by the command above) works.
+See `PORTING_PLAN.md` §12 for details.
+
+## 6. Running inference with full offload on ttsim
+
+`run_inference.py` hardcodes `-ngl 0` - it will **never** exercise the TTNN
+offload. To exercise the backend, invoke `llama-cli` directly:
+
+```bash
 ./build/bin/llama-cli \
   -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
   -p "You are a helpful assistant" \
-  -n 32 -t 2 \
+  -n 16 -t 2 --single-turn \
   -ngl 99 -dev TT_METALIUM0
 ```
 
-`-ngl 99` fait passer les tenseurs de poids I2_S des couches sur le buffer
-device du backend TTNN ; le graph-splitter de ggml-backend garde
-automatiquement tout ce que `supports_op()` refuse (norms, RoPE, softmax,
-KV-cache...) sur CPU. Attends-toi à une génération lente : ttsim est un
-simulateur fonctionnel, pas un modèle de perf, et chaque `mul_mat` offloadé
-fait actuellement un aller-retour host↔device (le buffer type ne stocke pas
-encore de `ttnn::Tensor` natif — voir `PORTING_PLAN.md` §11).
+- `-ngl 99` moves the `I2_S` weights of every layer onto the TTNN backend's
+  device buffer; ggml-backend's graph-splitter automatically keeps
+  everything `supports_op()` refuses (norms, RoPE, softmax...) on CPU.
+- `--single-turn` makes `llama-cli` exit after one response instead of
+  dropping into the interactive chat loop (which, with no useful stdin,
+  spins on empty lines).
+- **No `-nkvo` needed**: the KV-cache also runs on `TT_METALIUM0` now
+  (written via `SET_ROWS`, read back via `VIEW` - see `PORTING_PLAN.md`
+  §19). Passing it still forces the KV-cache onto CPU; that remains a valid
+  configuration if you want to compare, not a required workaround.
 
-## 6. Limitations connues à garder en tête
+Actual output observed in this environment (section 2 variables exported,
+section 5 model in place):
 
-Détail complet dans `PORTING_PLAN.md` §9-11 ; résumé :
+```
+> You are a helpful assistant
+a helpful assistant, you are an assistant, you are a helpful assistant. However
+[ Prompt: 13.4 t/s | Generation: 1.3 t/s ]
+Exiting...
+```
 
-- **Vues de tenseurs non supportées** : `init_tensor` fait un
-  `GGML_ASSERT` si `view_src != NULL`. Pas encore rencontré par le
-  chargement des poids, mais bloquant dès qu'un op créant des vues
-  (KV-cache typiquement) serait offloadé.
-- **Un `MeshBuffer` par tenseur, toujours accédé en entier** — deux bugs
-  tt-metal (offset host mal calculé, écritures/lectures "interior" qui
-  atterrissent à l'offset 0) empêchent le partage d'un buffer entre
-  tenseurs à des sous-offsets, comme le font CUDA/Metal/RPC normalement.
-- **Le `MeshDevice` n'est jamais détruit** (fuite volontaire) — un bug
-  tt-metal fait planter la destruction après qu'un op a rempli le program
-  cache. Sans conséquence pour un process qui se termine de toute façon,
-  mais à savoir si tu instrumentes des tests qui recréent des devices en
-  boucle dans le même process.
-- Ces trois bugs sont documentés comme probablement présents aussi sur
-  silicium réel (logique host-side C++, pas un artefact de simulation) —
-  pas encore remontés en amont.
+The quality of the generated text doesn't matter here (a 2B-parameter model,
+16 tokens, no sampling tuning) - what matters is that the offload pipeline
+runs without asserting/crashing, which is all this port validates at this
+stage. Expect slow generation (~1 t/s): ttsim is a functional simulator, not
+a performance model, and every offloaded `mul_mat`/`SET_ROWS` does a
+host↔device round trip per call (see section 7).
 
-## 7. Dépannage rapide
+## 7. Known limitations to keep in mind
 
-| Symptôme | Cause probable |
+Full detail in `PORTING_PLAN.md` §9, §13-19; summary:
+
+- **Performance is not representative**: every offloaded `mul_mat` and
+  `SET_ROWS` does a full host↔device round trip per call (the buffer type
+  doesn't store an optimized native representation, and ttsim is a
+  functional simulator, not a timing model). The t/s numbers shown say
+  nothing about real silicon - performance work is explicitly deferred
+  until real hardware exists (`PORTING_PLAN.md` §8).
+- **Only one prompt/shape tested end to end**: longer generations, multiple
+  prompts, batch>1 remain unverified.
+- **L1 capacity**: the ternary matmul kernel (Option B) reads the entire
+  packed weight blob into a resident L1 CB in one shot - correct for this
+  2B model (the test doesn't fail), but not yet verified at larger scale; a
+  chunked/streamed weight load is still needed before this scales to bigger
+  layers.
+- **One `MeshBuffer` per root tensor, always accessed whole** - two
+  tt-metal bugs (miscalculated host offset, "interior" writes/reads landing
+  at offset 0) prevent direct access to a sub-region of a buffer. Views
+  (`view_src != NULL`) are supported (since `PORTING_PLAN.md` §16) but never
+  get their own buffer: they're resolved to their root tensor's buffer plus
+  an offset, and that offset is always applied **host-side** (read the
+  whole buffer, patch, write the whole buffer back) - never via an
+  "interior" device access, which sidesteps both bugs rather than fixing
+  them.
+- **The `MeshDevice` is never destroyed** (deliberate leak) - a tt-metal bug
+  crashes destruction once an op has populated the program cache. No
+  consequence for a process that's exiting anyway, but worth knowing if you
+  write tests that recreate devices in a loop within the same process.
+- These tt-metal bugs are documented as likely present on real silicon too
+  (host-side C++ logic, not a simulation artifact) - not yet reported
+  upstream.
+
+## 8. Quick troubleshooting
+
+| Symptom | Likely cause |
 |---|---|
-| `TT_FATAL: Root Directory is not set.` | `TT_METAL_RUNTIME_ROOT` non exporté (section 2) |
-| `error while loading shared libraries: libtt_metal.so` | `LD_LIBRARY_PATH` ne pointe pas vers `$TT_METAL_HOME/build_Release/lib` |
-| Pas de `TT_METALIUM0` dans `--list-devices` | build fait sans `-DGGML_TTNN=ON`, ou `find_package(TT-Metalium)`/`find_package(tt-nn)` a échoué au configure (relire les logs `cmake -B`) |
-| `include could not find requested file: .../build_Release/Metalium.cmake` | `TT-Metalium_DIR` pointe (souvent via un cache pollué) vers le config cassé à la racine de `build_Release/` au lieu de `build_Release/lib/cmake/tt-metalium/`. Repasse les deux `-DTT-Metalium_DIR=...`/`-Dtt-nn_DIR=...` explicitement (section 3) — un `-D` en CLI écrase toujours le cache. |
-| `TT-Metalium_DIR-NOTFOUND` ou un chemin commençant par `/build_Release/...` | `TT_METAL_HOME` n'était pas exporté dans le shell qui a lancé `cmake` — exporte-le d'abord (section 2), dans le **même** shell. |
-| `UnimplementedFunctionality: <opcode>` venant de ttsim | gap dans l'ISA simulée, pas un bug BitNet — à isoler et remonter sur [tenstorrent/ttsim](https://github.com/tenstorrent/ttsim/issues) |
-| `Getting NOC translation status is not supported...` | `tt-umd` trop ancien (fixes TTSim manquants) |
-| Crash à la sortie du process après une inférence réussie | Le bug §11 "destruction de MeshDevice" — le process se termine, sans impact |
+| `TT_FATAL: Root Directory is not set.` | `TT_METAL_RUNTIME_ROOT` not exported (section 2) |
+| `error while loading shared libraries: libtt_metal.so` | `LD_LIBRARY_PATH` doesn't point at `$TT_METAL_HOME/build_Release/lib` |
+| No `TT_METALIUM0` in `--list-devices` | Built without `-DGGML_TTNN=ON`, or `find_package(TT-Metalium)` failed at configure time (re-read the `cmake -B` logs) |
+| `include could not find requested file: .../build_Release/Metalium.cmake` | A second, broken `tt-metalium-config.cmake` sits at the root of `build_Release/` (no `Metalium.cmake` next to it) and was found first. Pass `-DTT-Metalium_DIR=$TT_METAL_HOME/build_Release/lib/cmake/tt-metalium` explicitly (a CLI `-D` always overrides the cache), and if needed `-DCMAKE_PREFIX_PATH=$TT_METAL_HOME/build_Release` for TT-Metalium's own transitive `find_dependency()` calls (umd, spdlog, tt-logger, fmt...). |
+| `TT-Metalium_DIR-NOTFOUND` or a path starting with `/build_Release/...` | `TT_METAL_HOME` wasn't exported in the shell that ran `cmake` - export it first (section 2), in the **same** shell. |
+| `error: externally-managed-environment` running `setup_env.py` | System Python protected by PEP 668 (recent Debian/Ubuntu) - use a venv (section 5), not `--break-system-packages`. |
+| `GGML_ABORT("pre-allocated tensor (...) ... cannot run the operation (X)")` | A new op that creates/consumes a view isn't in `supports_op()` yet. Same shape of problem as `PORTING_PLAN.md` §12/§16/§19 - check whether the plan already documents this case before starting a fresh investigation. |
+| `UnimplementedFunctionality: <opcode>` from ttsim | A gap in the simulated ISA, not a BitNet bug - isolate and report on [tenstorrent/ttsim](https://github.com/tenstorrent/ttsim/issues) |
+| `Getting NOC translation status is not supported...` | `tt-umd` too old (missing TTSim fixes) |
+| Crash on process exit after a successful inference run | The §11 "MeshDevice destruction" bug - the process is exiting anyway, no impact |
 
-Pour tout le reste (compilation SFPI, pytest LLK bas niveau, architectures
-supportées), voir directement
-[`tt_metal/tt-llk/tests/TTSIM.md`](../../tt-metal/tt_metal/tt-llk/tests/TTSIM.md).
+For everything else (SFPI compilation, low-level LLK pytest, supported
+architectures), see
+[`tt_metal/tt-llk/tests/TTSIM.md`](../../tt-metal/tt_metal/tt-llk/tests/TTSIM.md)
+directly.
