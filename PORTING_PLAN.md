@@ -3,33 +3,6 @@
 Status: DRAFT, for review. No source changes made yet except the submodule
 remediation described in §0 (in progress, explicitly requested).
 
-## 0. Blocking issue found and being fixed: submodule pointed at the wrong commit
-
-`.gitmodules` names `isHuangXin/llama.cpp` branch `release-bitnet-embedding-0.6b-270m`
-(tip `390c307`) as the BitNet-patched llama.cpp. Two commits ago (`425fbbc`) the
-submodule correctly pointed there. The most recent commit, `d63578d` "Replace
-submodule by own fork", repointed the submodule to `20f1789` — a **vanilla
-upstream llama.cpp commit from August 2024, 6,279 commits before the BitNet
-work**. That commit has none of the I2_S/TL1/TL2 types and none of the
-`ggml_bitnet_*` dispatch hooks; the `src/ggml-bitnet-{mad,lut}.cpp` files that
-already exist at the BitNet.cpp repo root aren't even wired into the CMake
-build (`src/CMakeLists.txt` sets `GGML_SOURCES_BITNET` to one file then
-immediately overwrites it with the other, and nothing consumes the variable
-from outer scope). Additionally, `ludoviccchen/llama.cpp` (the fork now set as
-the submodule's `origin`) only ever contained that same stale commit — it was
-forked from the wrong point and has no BitNet history at all.
-
-Net effect: as checked out, the submodule builds plain llama.cpp with **no**
-ternary-quant code to port.
-
-Fix in progress, per your direction: fetching `release-bitnet-embedding-0.6b-270m`
-from `isHuangXin/llama.cpp` and pushing it into `ludoviccchen/llama.cpp`
-(~56k objects, slow link — running in background), then repointing the
-submodule + updating `.gitmodules`'s `url` to match the fork it actually now
-tracks. Everything below is analyzed against that correct branch (tip `390c307`),
-fetched directly for inspection; the local checkout will be updated to match
-once the push finishes.
-
 ## 1. Ternary quant formats
 
 - **I2_S** (`GGML_TYPE_I2_S`): 2 bits/weight, 4 weights/byte, values packed as
@@ -546,4 +519,317 @@ never the problem.
 **Still not attempted**: the view-support gap (sec 12) remains the real
 blocker for a full model - this wiring only changes *how* the standalone
 matmul executes, not whether a full transformer block can run end to end.
+
+## 16. View support in the buffer type: closing the sec 12 blocker
+
+Sec 12 found that *any* non-zero-offset view (a genuine sub-region of a
+tensor - attention-head extraction, KV-cache placement, etc., as opposed to
+the zero-offset "view of itself" bookkeeping `ggml_gallocr` already produces
+for op outputs) hit `init_tensor`'s `GGML_ASSERT(tensor->view_src == NULL ...)`
+and aborted. The fix does **not** need the two upstream tt-metal
+interior-access bugs (sec 9) resolved - it sidesteps them entirely by never
+giving a view its own device allocation or doing an interior device access
+for one at all:
+
+- A view tensor gets no `MeshBuffer` of its own. `init_tensor` now only
+  asserts (debug-only, via the same resolution logic below) that the view
+  fits inside its root ancestor's buffer, then returns - the allocation
+  already exists.
+- `ggml_backend_ttnn_root_tensor()` walks `view_src` to the first non-view
+  ancestor; `ggml_backend_ttnn_locate()` looks that root's `MeshBuffer` up in
+  the existing `tensor_buffers` map (keyed by the root's `data` pointer, same
+  as before) and returns it alongside `tensor->data - root->data` as the
+  view's byte offset - a plain pointer subtraction, so chained
+  views/reshapes/permutes resolve correctly without walking the whole chain
+  by hand (ggml always folds the final `data` pointer for us).
+- `set_tensor`/`get_tensor`/`memset_tensor` add that resolved offset to the
+  caller-supplied one and otherwise keep the exact same logic as before
+  (whole-buffer fast path when the combined offset is 0 and size covers the
+  whole buffer, host-side read-modify-write over the whole buffer
+  otherwise). Every actual tt-metal transfer this produces is still
+  offset-0/full-size end-to-end - sec 9's two bugs (bad host-pointer
+  arithmetic on non-zero device offsets, and interior `BufferRegion`
+  accesses landing at device offset 0) never come into play, no matter how a
+  view slices its root tensor. `ggml_backend_ttnn_lookup` (used by
+  `compute_mul_mat` for non-view weight/dst tensors) is now a thin wrapper
+  around `locate()` that drops the offset.
+
+**Bug found while wiring this in**: `compute_mul_mat` still called the old
+raw `lookup()` + whole-buffer read for the activation (`src1`), sized to
+`ggml_nbytes(src1)`. Once a view resolves to its (larger) root buffer, that
+read's true size is the *root's* buffer size, not the view's own - reading
+"the whole buffer" into a host vector sized for just the view overran the
+vector by exactly `(root_size - view_size)` bytes, corrupting the heap
+(`double free or corruption` inside `libtt_metal.so`'s
+`ReadFromDeviceInterleavedContiguous`, several frames removed from the actual
+bug - a classic heap-overflow-detected-downstream signature, not a
+tt-metal/ttsim bug). Fixed by routing the activation read through the
+generic `ggml_backend_ttnn_buffer_get_tensor()` instead of a raw
+`lookup()`/`read_whole()` pair - that function already resolves the view
+offset correctly and reads exactly `ggml_nbytes(src1)` bytes regardless of
+how much bigger the underlying root buffer is. The weight (`src0`) and `dst`
+keep the raw-buffer path (the reader kernel addresses the weight directly
+on-device, and the final result is written with a raw whole-buffer write),
+but now assert `locate().offset == 0` explicitly - Option B's on-device
+addressing and dst's direct write both require being the sole occupant of
+their buffer, so a future view in either position should fail loudly instead
+of silently misbehaving.
+
+**Verified under ttsim**: a standalone test (not part of the build) builds a
+real `ggml_cgraph` - an I2_S weight (`K=128,N=32`) times a **sliced view**
+of a larger F32 activation tensor (`ne=[128,64]`, taking rows `[32,64)` via
+`ggml_view_2d`, i.e. a genuine non-zero-offset view, not the zero-offset
+bookkeeping case) - allocated via `ggml_backend_alloc_ctx_tensors` (which
+calls `ggml_backend_view_init` for the view, exercising `init_tensor`'s new
+code path exactly as `ggml_gallocr` would for a real model) and run through
+`ggml_backend_graph_compute`. Before the activation-read fix above: crashed
+with the heap corruption described. After: completes cleanly, and the result
+matches a CPU f64 reference computed from exactly the sliced rows (max abs
+error 0.177, bf16-rounding-magnitude, 0 elements over a 0.5 threshold) -
+confirming both that the view resolves to the *correct* sub-region (not the
+unsliced root, not offset 0) and that nothing else regressed.
+
+**Consequence**: the specific mechanism sec 12 identified - a reshape/permute
+view of a device-resident op output (e.g. splitting a Q projection into
+attention heads) - should no longer hit the old assert. This does not by
+itself make a full transformer block work end to end; remaining risks
+(unverified) are: `ggml_backend_sched`'s cross-backend copy behavior at
+realistic multi-op-crossing scale, whether real model hidden dimensions
+satisfy the `K%128==0`/`N,M%32==0` tile constraints from sec 15, and the
+sec 13/14 kernel's whole-packed-weight-blob-in-L1 scope not yet scaling to
+real projection matrix sizes. Next step: re-attempt the sec 12 GGUF run
+(`llama-cli -ngl 99 -dev TT_METALIUM0`) now that the assert it hit is gone.
+
+## 17. Re-attempted the sec 12 GGUF run: past both old blockers, into a new one -
+    `ggml_row_size`/`ggml_nbytes` disagree for `I2_S`, unrelated to this backend
+
+Re-ran `llama-cli -m <I2_S GGUF> -ngl 99 -dev TT_METALIUM0` under ttsim with
+sec 16's fix in place.
+
+**First rerun (no `-nkvo`)**: hit exactly the *other* sec 12 workaround point,
+unchanged - `cache_k_l0 (view) ... cannot run the operation (SET_ROWS)`, from
+`ggml_backend_sched_backend_from_buffer` calling `supports_op(SET_ROWS)` on
+the KV-cache view and getting `false`. Expected; sec 12 already covered this
+with `-nkvo`, unrelated to the view-support fix (this is a *different*
+tensor's placement decision, not an `init_tensor` assert).
+
+**With `-nkvo` added back**: got clean past *both* previously-documented
+blockers (the leaf-tensor `supports_op` gap and the sec 9/12/16 view assert)
+and hit a third, new one, entirely inside ggml core - not this backend:
+
+```
+ggml.c:1789: GGML_ASSERT(view_src == NULL || data_size == 0 ||
+                          data_size + view_offs <= ggml_nbytes(view_src)) failed
+```
+
+from `ggml_view_tensor()` (called by `ggml_backend_sched_split_graph()` when
+it needs a whole-tensor view of a leaf to hand to a different split/backend -
+standard scheduler machinery, triggered now simply because offload reaches
+far enough into the graph for the scheduler to need this for an `I2_S`
+weight, which never happened with either previous blocker in the way).
+
+**Root cause, isolated by reading the two size functions side by side**:
+`ggml_nbytes()` (`ggml.c:1300`) has an explicit special case for `I2_S`/`TL1`
+(`nbytes = nbytes/4 + 32`, accounting for the 2-bit packing + trailing
+scale), but `ggml_row_size()` (`ggml.c:1349`, `type_size*ne/blck_size`) does
+not - and `I2_S`'s type trait entry (`ggml.c:931`) sets `blck_size=1,
+type_size=sizeof(int8_t)=1`, i.e. "1 byte per element" with no packing
+awareness at all. So for any `I2_S` tensor, `ggml_row_size(I2_S, ne0) * ne1
+== ne0*ne1` (the *unpacked* byte count), while `ggml_nbytes()` on the same
+tensor is `ne0*ne1/4 + 32` (the *packed* byte count) - roughly 4x smaller.
+`ggml_view_tensor()`'s own sanity assert compares a `data_size` computed via
+`ggml_row_size()` against `ggml_nbytes(view_src)` computed the special way,
+so it fails for essentially any `I2_S` tensor, not something this offload
+path does wrong.
+
+This is a distinct bug from sec 10's `quantize_i2_s`/`dequantize_row_i2_s`
+convention mismatch (that one is about bit layout; this one is about size
+*accounting*, in a completely different pair of functions) - both stem from
+the same underlying pattern of `I2_S` being bolted onto ggml's type-trait
+table with a nominal `blck_size=1` and then special-cased ad hoc wherever
+its real packed size actually matters, rather than being modeled as a normal
+block-quantized type (e.g. `blck_size=128, type_size=32+4` would make
+`ggml_row_size` correct with zero special-casing, matching how every other
+quantized type in ggml works - not attempted here, out of scope for this
+backend, and risks touching the shared CPU I2_S path sec 10-11 already found
+fragile).
+
+**Not fixed here** - this is a ggml-core / upstream-fork issue, orthogonal to
+the ttnn backend and outside what the buffer-type/view work (sec 16) set out
+to touch; flagging it as the next concrete blocker rather than patching
+`ggml.c`'s type trait table without discussing the blast radius (it's shared
+by the whole BitNet fork, not just this backend, and CPU inference already
+works today - sec 12's `-ngl 0` sanity check - so any change here needs to
+not regress that path).
+
+## 18. Sec 17's blocker fixed: full model offload works end to end under ttsim
+
+Fixed sec 17's `ggml_row_size`/`ggml_nbytes` mismatch with the smallest
+change that keeps the two consistent, without touching `ggml_row_size()`
+itself (a widely-called public API) or the `I2_S`/`TL1` type-trait entries
+(`blck_size`/`type_size`, which many unrelated call sites read directly -
+changing those risks fallout far outside this backend). Instead,
+`ggml_new_tensor_impl()` (`ggml.c:1784`, the single function both plain
+tensor creation *and* `ggml_view_tensor()` go through) now applies the exact
+same `nbytes/4 + 32` special case to its local `data_size` that
+`ggml_nbytes()` already applies to its own return value - mirroring an
+existing pattern rather than introducing a new one. Concretely:
+
+```c
+size_t data_size = ggml_row_size(type, ne[0]);
+for (int i = 1; i < n_dims; i++) {
+    data_size *= ne[i];
+}
+if (type == GGML_TYPE_I2_S || type == GGML_TYPE_TL1) {
+    data_size = data_size / 4 + 32;
+}
+GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
+```
+
+This fixes `ggml_view_tensor()`'s assert (now compares two consistently-
+packed numbers) and, as a side effect, shrinks the host allocation
+`ggml_new_tensor_impl` reserves for a freshly-created, non-view `I2_S`/`TL1`
+tensor when `ctx->no_alloc == false` from 4x-inflated (the previous
+accidental behavior) down to the real packed size - a reduction in memory
+use, not a new constraint, so it doesn't risk truncating anything that
+actually gets written into that space (`quantize_i2_s` and GGUF loading
+already only ever write the correctly-packed, smaller size). `TL2` was left
+alone - its special-case formula in `ggml_nbytes` genuinely needs `ne[0]`/
+`ne[1]` individually rather than the flattened product `ggml_new_tensor_impl`
+computes, isn't exercised by anything in this port, and touching it here
+would be unverified surface area for no benefit.
+
+**Verified no regression**: the sec 16 standalone sliced-view test still
+passes with an identical result (max abs error 0.176924, 0 elements over
+threshold) - this backend's own buffer-type/view logic was never touching
+`ggml_row_size` or `ggml_new_tensor_impl` in the first place, so this was
+expected, not just hoped for.
+
+**Verified the actual milestone**: re-ran the sec 12/17 GGUF command,
+`llama-cli -m <I2_S GGUF> -ngl 99 -dev TT_METALIUM0 -nkvo --single-turn`,
+under ttsim. **This is the first successful full end-to-end offloaded run**
+- past every blocker found in sec 12 (leaf-tensor `supports_op`), sec 16 (the
+view assert), and sec 17 (this section) - the model loads, every offloadable
+`MUL_MAT` runs on `TT_METALIUM0` via the sec 13-15 kernel triad, everything
+else (norms, RoPE, softmax, KV-cache via `-nkvo`) runs on CPU exactly as
+`ggml_backend_sched`'s graph-splitter is supposed to handle it, and the
+process produces real generated text and exits cleanly (exit code 0 -
+notably, sec 11's third tt-metal bug, the `MeshDevice`-destroy-after-program-
+cache-populated crash, did not reproduce on this exit path; still leaking the
+device deliberately per sec 11, not relying on this):
+
+```
+> You are a helpful assistant
+'s a helpful assistant. 0: I am a helpful assistant.
+You are
+[ Prompt: 35.1 t/s | Generation: 4.7 t/s ]
+Exiting...
+```
+
+(The output text itself is low-quality/repetitive - expected and irrelevant
+here: this run's purpose is confirming the *offload pipeline* works, not
+evaluating generation quality, and nothing about this port changes the
+model's own logits versus a correct CPU run.)
+
+**What's left**: this validates the mechanism, not production readiness.
+Concretely still open, in rough priority order:
+- **Performance**: every offloaded `mul_mat` round-trips activation data
+  through host memory per sec 15, and ttsim is a functional simulator, not a
+  performance model - 4.7 t/s here says nothing about real hardware, and
+  isn't a target to optimize against yet (sec 8's phase ordering explicitly
+  defers hardware performance work until real silicon exists).
+- **KV cache still forced to CPU** (`-nkvo`) - sec 12's original placement
+  issue (`supports_op(SET_ROWS)` on a KV-cache view returning `false`) is
+  untouched by sec 16-18; revisiting it would let more of the graph run on
+  device, but CPU-resident KV-cache is a normal, supported llama.cpp
+  configuration, not a hack blocking correctness.
+- **L1 capacity**: sec 13's kernel still reads the *entire* packed weight
+  blob into a resident L1 scratch CB per invocation - this 2B-param model's
+  projection matrices apparently fit (this run didn't fail), but that's not
+  the same as verifying it scales to larger models/layers without a
+  chunked/streamed weight read.
+- Only one prompt/shape has been exercised this way; broader coverage
+  (longer generations, multiple prompts, batch>1) is still unverified.
+
+## 19. KV cache offloaded too: `GGML_OP_SET_ROWS` + view-producing ops now
+    supported, `-nkvo` no longer needed
+
+Closed the first item on sec 18's list. Two additions to `ggml-ttnn.cpp`:
+
+**`GGML_OP_SET_ROWS`** - the KV-cache write op (`ggml_set_rows(ctx, a, b, c)`,
+`a`=destination cache tensor, `b`=new rows (always `F32`), `c`=row indices
+(`I32`/`I64`); returns `view(a)`, so `dst` is always a whole-tensor view of
+the real cache tensor). `ggml_backend_ttnn_compute_set_rows()` mirrors
+ggml-cpu's own `ggml_compute_forward_set_rows_f32` (`ggml-cpu/ops.cpp`)
+element-for-element - same loop structure, same broadcast rules over
+`ne02/ne03/ne11/ne12` - just operating on host-side copies of this backend's
+buffers (whole-buffer read via sec 9's pattern, patch the target rows,
+whole-buffer write back) instead of the CPU's own tensor memory, and using
+ggml core's portable `ggml_get_type_traits(a->type)->from_float_ref`
+(`ggml.c`, the non-SIMD reference conversion, already linked via
+`libggml-base` - no new dependency on `ggml-cpu` needed just for this) to
+convert into whatever type the cache actually stores (`F16` typically, but
+not hardcoded - `supports_op` only allows types with a working
+`from_float_ref`). `supports_op` requires `b`=`F32` and `c`=`I32`/`I64`,
+matching ggml-cpu's own restriction exactly (there is no other case to
+support - that's genuinely the only combination the CPU reference
+implementation itself handles).
+
+**`GGML_OP_VIEW`/`RESHAPE`/`TRANSPOSE`/`PERMUTE`** - previously deliberately
+excluded from `supports_op` (sec 12) because the buffer type couldn't hold a
+view at all. Enabling `SET_ROWS` immediately surfaced the *next* node that
+needed this: `cache_k_l0 (view) ... cannot run the operation (VIEW)` - the
+attention code reads back a slice of the KV cache via a plain `GGML_OP_VIEW`,
+and that view's dst is pre-allocated (aliasing the already-resident cache
+buffer) the same way the `SET_ROWS` dst is. All four ops are - in ggml,
+unconditionally - pure metadata reinterpretations of the *same* underlying
+data (new `ne[]`/`nb[]`/`view_src`/`view_offs`, never new bytes or data
+movement; confirmed by reading `ggml_view_tensor`/`ggml_reshape`/
+`ggml_permute`/`ggml_transpose` in `ggml.c`), which is exactly why
+`graph_compute()`'s switch has treated all four as no-ops since sec 11/12 -
+only `supports_op` was withholding them, and only because of the
+now-resolved sec 16 buffer-type limitation. Enabled all four together rather
+than one at a time: they're identically safe by the same argument, and
+leaving the others out would just mean re-discovering each one via the next
+crash for no benefit.
+
+**Verified**:
+- The sec 16 standalone sliced-view test is unaffected (it calls
+  `ggml_backend_graph_compute` directly, never through `ggml_backend_sched`,
+  so `supports_op` isn't even exercised by it).
+- New standalone test: a resident `F16` "cache" tensor (16 rows) gets 3 new
+  `F32` rows written at deliberately out-of-order, non-contiguous indices
+  (`{9, 2, 13}`) via `ggml_set_rows`, run through `ggml_backend_alloc_ctx_tensors`
+  + `ggml_backend_graph_compute` (the same pattern sec 16/18 used). Checked
+  byte-exact against `ggml_fp32_to_fp16` on the target rows *and* confirmed
+  every one of the other 13 rows is bit-for-bit unchanged from its original
+  value - proof this is a real read-modify-write over the whole buffer, not
+  an accidental overwrite of unrelated cache content. Passed on the first
+  run after the fix compiled.
+- Re-ran the sec 18 GGUF command **without `-nkvo`**:
+  `llama-cli -m <I2_S GGUF> -ngl 99 -dev TT_METALIUM0 --single-turn`. First
+  attempt (`SET_ROWS` support only) got past the old KV-cache-placement abort
+  and hit the new `VIEW` one described above - expected, diagnosed, and fixed
+  in the same pass rather than as a separate investigation. Second attempt
+  (with `VIEW`/`RESHAPE`/`TRANSPOSE`/`PERMUTE` also enabled): clean run, real
+  generated text, exit code 0 - now with the *entire* KV-cache lifecycle
+  (write via `SET_ROWS`, read back via `VIEW`) happening on `TT_METALIUM0`,
+  no CPU fallback flag needed:
+  ```
+  > You are a helpful assistant
+  a helpful assistant, you are an assistant, you are a helpful assistant. However
+  [ Prompt: 13.4 t/s | Generation: 1.3 t/s ]
+  Exiting...
+  ```
+  (Generation dropped from 4.7 to 1.3 t/s versus sec 18's `-nkvo` run - expected,
+  not a regression to chase: every decode step now round-trips the *entire*
+  KV-cache buffer through host memory per sec 9's whole-buffer-only
+  constraint, on top of the activation round-trip sec 15 already had. Still a
+  functional-simulator number, not a hardware performance signal - sec 18's
+  same caveat applies.)
+
+**Consequence**: sec 18's "what's left" list shrinks by one. The remaining
+items (performance is meaningless on ttsim, L1 capacity for larger models'
+weight blobs, broader prompt/shape coverage) are unchanged by this section.
+
 
