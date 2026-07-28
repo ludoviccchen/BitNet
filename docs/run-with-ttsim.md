@@ -204,7 +204,7 @@ host↔device round trip per call (see section 7).
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-21; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-22; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -219,8 +219,18 @@ Full detail in `PORTING_PLAN.md` §9, §13-21; summary:
   kernel's `M % 32 == 0` tile-alignment requirement means only large enough
   prefill batches offload; steady-state generation's matmuls fall back to
   CPU via the normal scheduler mechanism (not a bug, just a narrower win
-  than "full offload" suggests). See §21 for the measurement and what
-  closing it would take.
+  than "full offload" suggests).
+- **Decode-step (`M=1`) offload attempted, reverted**: `PORTING_PLAN.md` §22
+  implemented and verified (in isolation) a fix for the §21 gap - padding
+  the activation to a tile boundary so any `M >= 1` is offloadable. Enabling
+  it, though, surfaced a much bigger problem: the reader kernel's ternary
+  unpack loop takes minutes per call at this model's real projection sizes
+  under ttsim (measured: one `K=2560,N=2560` call didn't finish in over
+  580s), invisible until now because the `M%32==0` gate had incidentally
+  kept real per-layer decode matmuls away from this kernel entirely. The
+  `M%32==0` check is restored by default so the smoke test below stays fast
+  (~15-30s) - the padding fix is in place and correct, just not switched on,
+  pending a real optimization pass on the reader kernel's unpack loop.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB

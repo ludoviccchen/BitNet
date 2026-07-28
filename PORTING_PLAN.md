@@ -965,4 +965,86 @@ meaningfully anyway (sec 8/18) - worth doing once real hardware makes the
 tradeoff measurable, flagged here as the natural next step rather than done
 as part of this pass.
 
+## 22. Attempted sec 21's M-padding fix: correct in isolation, but blocked by
+    a much bigger, previously-hidden reader-kernel scalability wall
+
+Implemented the fix sec 21 proposed: `ggml_backend_ttnn_compute_mul_mat()`
+now rounds `M` up to `Mt = ceil(M/32)` M-tiles, builds the transposed/tiled
+activation at that padded width (`M_padded = Mt*32`, extra columns left
+zero by `act_transposed`'s value-initializing sized constructor), and after
+`untilize_nfaces` truncates back to the real `M` when writing `dst` (only
+the real `out_host[m*N+n]` rows are written; `result[n*M_padded+m]`'s
+`[M, M_padded)` columns - all-zero-activation outputs - are simply never
+read). `K % 128` and `N % 32` are unaffected (weight-shape constraints, not
+activation-shape).
+
+**Correctness verified in isolation**: two standalone tests (same
+methodology as sec 13/16/18 - a real `ggml_cgraph` through
+`ggml_backend_graph_compute`, not a hand-rolled dispatch), both against a
+small `K=128,N=32` weight: `M=5` (arbitrary non-tile-aligned) matched a CPU
+f64 reference to `max_abs_err=0.056` (0/160 over a 0.5 threshold); `M=1`
+(the literal decode-step shape) matched to `max_abs_err=0.004` (0/32 over
+threshold) - both within the same bf16-rounding tolerance every prior
+kernel validation in this document has seen. The padding/truncation logic
+itself is correct.
+
+**But relaxing `ggml_backend_ttnn_mul_mat_shape_ok()`'s `M % 32 == 0` check
+to actually use this at runtime surfaced a much larger problem**, found
+while re-verifying against the real GGUF: a `GGML_SCHED_DEBUG=2` run at
+`-n 4` never got through even the first forward pass in over 280s (it had
+previously taken ~15-20s total for `-n 4`), and a longer attempt eventually
+aborted (`terminate called without an active exception`, SIGABRT) partway
+through - initially suspected as a new tt-metal stability bug in the same
+family as sec 9/11.
+
+**Root-caused with two isolated standalone tests**, bypassing llama.cpp
+entirely to separate "many calls" from "real-sized calls":
+- Looping the *same* small (`K=128,N=32,M=1`) call 300 times in one process
+  reached 220+ iterations in under 280s with no crash - ruling out pure call
+  volume (Program/MeshBuffer create-destroy churn) as the cause.
+- A *single* call at one of this model's actual per-layer shapes
+  (`K=2560,N=2560,M=1`, e.g. `attn_q`/`attn_output`) did not complete within
+  580 seconds (measured directly, no crash - just still running).
+
+Root cause: the reader kernel's ternary-unpack loop (sec 13/14) is
+`Nt*Kt` 32x32-tile iterations, each unpacking 1024 elements with a scalar
+per-byte loop (`kernels/ternary_matmul/dataflow/reader_ternary_mm.cpp`) -
+for `K=2560,N=2560`, that is `80*80*1024 = 6.55M` scalar loop iterations,
+simulated instruction-by-instruction by ttsim (a functional simulator, not
+built for throughput). This cost is **independent of `M`** - it was never
+about M-padding specifically. The reason it was invisible through sec
+13-21 is that `M % 32 == 0` incidentally also gated out virtually all
+real per-layer decode-time `MUL_MAT` calls (sec 21's own finding: ordinary
+decode has `M=1`), so no test before this one had ever actually pushed a
+real `K,N` in the thousands through this reader kernel's unpack loop under
+ttsim and measured how long it takes. The sec 11 `MeshDevice`-destroy crash
+this superficially resembled is unrelated; the abort earlier in this section
+is most plausibly what happens when a process stuck for minutes inside this
+loop gets forcibly terminated (by an external timeout) rather than a
+distinct tt-metal bug - not confirmed further, since the real, actionable
+finding (the unpack loop's cost) doesn't need that resolved to be understood.
+
+**Decision**: keep the M-padding logic in `compute_mul_mat` (correct,
+verified, and harmless when unused - `M_padded == M` whenever `M` is
+already tile-aligned, its only live case today), but **restore**
+`ggml_backend_ttnn_mul_mat_shape_ok()`'s `M % 32 == 0` requirement rather
+than ship it relaxed by default. Enabling it would turn the existing,
+validated `-ngl 99` smoke test (`docs/run-with-ttsim.md` sec 6, normally
+~15-30s for `-n 16`) into something taking many minutes to hours per run,
+for a problem the padding fix doesn't cause and can't fix on its own - a
+severe regression to a currently-working, documented workflow, discovered
+only because this fix finally let real-shaped decode matmuls reach the
+kernel at all. Re-verified after restoring the gate: `-n 16` completes in
+~16s wall time, `8/8` JIT cache hits, unchanged from before this section.
+
+**Consequence / next step**: sec 21's finding stands - ordinary decode-step
+`MUL_MAT` still never reaches `TT_METALIUM0` - but the fix is no longer
+"relax the M constraint" (that part is done and ready). The actual blocker
+is now the reader kernel's unpack loop needing a real optimization pass
+(e.g., vectorizing the 32x32 unpack with SFPU ops instead of a scalar
+per-byte RISC-V loop) before it's practical to exercise at real projection-
+matrix dimensions under ttsim at all - independent of M-alignment, and
+worth doing before any further real-model ttsim testing, not just before
+re-enabling decode-step offload.
+
 
