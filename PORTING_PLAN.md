@@ -892,4 +892,77 @@ double-buffered/prefetched streaming (the current chunk read is a blocking
 this kernel) are both left as possible follow-up performance work, out of
 scope while performance is explicitly deferred to real silicon (sec 8/18).
 
+## 21. Broader coverage pass: longer generations, varied prompts, batch>1 -
+    and a significant finding about how much MUL_MAT actually offloads
+
+Closed sec 18/19's "only one prompt/shape tested" item. All runs under
+ttsim, `-m <I2_S GGUF> -ngl 99 -dev TT_METALIUM0`, after sec 20's fix:
+
+- **Longer generation** (`-n 64`, same short prompt): completes cleanly,
+  exit 0, stable throughput (15.5 t/s prompt / 1.4 t/s generation) - KV
+  cache correctly accumulates 64 decode steps' worth of SET_ROWS/VIEW
+  traffic with no crash or corruption.
+- **Very short prompt** (`"Hi"`, `-n 16`): clean, exit 0.
+- **Long multi-sentence prompt** (~70 words, `-n 32`): clean, exit 0, and
+  notably higher prompt throughput (33.9 t/s) - consistent with more of the
+  larger prefill batch actually landing on-device (see finding below).
+- **Batch>1** (`llama-batched -np 4 -n 16 -kvu`, 4 parallel sequences,
+  unified KV cache): clean, exit 0, all 4 sequences produce real text
+  (`decoded 44 tokens in 5.32s, speed: 8.28 t/s`). Confirms multi-sequence
+  KV-cache row placement (different sequences writing/reading different
+  cache rows via SET_ROWS/VIEW) works, not just the single-sequence case
+  every other test in this document exercises. (Needed `-kvu` - the initial
+  attempt without it hit `split_equal: sequential split is not supported
+  when there are coupled sequences`, a stock llama.cpp KV-cache-mode
+  requirement for `llama-batched`, unrelated to this backend.)
+
+**Significant finding, via `GGML_SCHED_DEBUG=2 -v`**: instrumented a real
+run's scheduler node-placement log (`ggml_backend_sched_print_assignments`)
+to see which `MUL_MAT` nodes actually execute on `TT_METALIUM0` versus
+falling back to CPU. Result: the large majority never reach the device.
+Per-pass breakdown (one "pass" = one `llama_decode()` call, delimited by
+`GET_ROWS`) shows an unambiguous pattern: passes with a single new token
+(ordinary autoregressive decode, `M=1`) show **zero** `MUL_MAT` nodes placed
+on `TT_METALIUM0` - 100% CPU fallback; only passes carrying a large enough
+prefill batch show any device placement at all, and even then the
+non-I2_S-weight matmuls (`kq`/`kqv`, attention scores - never eligible for
+this backend regardless of shape) stay on CPU as expected. Root cause is
+`ggml_backend_ttnn_mul_mat_shape_ok()`'s `M % 32 == 0` check (sec
+13-15/kernel README - the FPU only operates on whole 32x32 tiles, and the
+kernel triad has no sub-tile or padding handling): a single-token decode
+step's activation matmul has `M=1`, a batch-of-4 parallel-sequence decode
+step has `M=4`, neither is a multiple of 32, so `supports_op()` correctly
+(per its own contract) returns `false` and `ggml_backend_sched` transparently
+routes those nodes to CPU - inserting a `CPU#<weight-name>` host-side copy of
+the (already-on-device) I2_S weight to do it, exactly the graph-splitter
+behavior sec 2 described as "the standard llama.cpp GPU-offload pattern".
+Nothing here is a bug: every fallback is exactly what `supports_op()`
+declares it can't handle, and the sec 18/19 "full offload" runs were
+correctly described at the level they were tested (the mechanism works, KV
+cache included) - but "every offloadable MUL_MAT runs on TT_METALIUM0" reads
+as stronger than it is once you know *how much* of a real run's matmul
+traffic is actually offloadable. Concretely, on the sec 18/19 GGUF at `-n 4`:
+828 of 3945 total `MUL_MAT` nodes (~21%) placed on `TT_METALIUM0`, and all
+828 came from the handful of passes with large-enough prefill batches - zero
+came from ordinary single-token decode passes, which is the dominant
+workload for interactive inference.
+
+**Consequence**: this backend's `MUL_MAT` kernel today mainly benefits
+prompt/prefill processing when the batch happens to be large and
+tile-aligned (or is chunked by llama.cpp's own ubatching into a tile-aligned
+piece), not steady-state token generation - the part of inference most
+sensitive to per-token latency. Closing this would mean relaxing
+`ggml_backend_ttnn_mul_mat_shape_ok()`'s `M % 32 == 0` requirement by
+padding the activation to the next tile boundary on upload (zero-filling the
+extra rows) and truncating the result back to the real `M` before writing
+`dst` - the `K % 128` and `N % 32` constraints are separate (weight-shape,
+not activation-shape) and unaffected. Not attempted here: it's a real
+kernel-integration change, not a coverage-testing exercise, and enabling it
+would add yet another whole-activation-buffer host round trip to every
+single decode step (on top of sec 19's KV-cache round trip), which on ttsim
+would show up as *slower* generation for a workload ttsim can't measure
+meaningfully anyway (sec 8/18) - worth doing once real hardware makes the
+tradeoff measurable, flagged here as the natural next step rather than done
+as part of this pass.
+
 

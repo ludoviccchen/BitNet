@@ -204,7 +204,7 @@ host↔device round trip per call (see section 7).
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-19; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-21; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -212,8 +212,15 @@ Full detail in `PORTING_PLAN.md` §9, §13-19; summary:
   functional simulator, not a timing model). The t/s numbers shown say
   nothing about real silicon - performance work is explicitly deferred
   until real hardware exists (`PORTING_PLAN.md` §8).
-- **Only one prompt/shape tested end to end**: longer generations, multiple
-  prompts, batch>1 remain unverified.
+- **Broader coverage**: verified (`PORTING_PLAN.md` §21) - longer
+  generations, varied prompts, and batch>1 (`llama-batched -np 4 -kvu`) all
+  complete cleanly. Along the way, found that ordinary single-token decode
+  steps (`M=1`) never actually place `MUL_MAT` on `TT_METALIUM0` - the
+  kernel's `M % 32 == 0` tile-alignment requirement means only large enough
+  prefill batches offload; steady-state generation's matmuls fall back to
+  CPU via the normal scheduler mechanism (not a bug, just a narrower win
+  than "full offload" suggests). See §21 for the measurement and what
+  closing it would take.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB
