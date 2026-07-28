@@ -832,4 +832,64 @@ crash for no benefit.
 items (performance is meaningless on ttsim, L1 capacity for larger models'
 weight blobs, broader prompt/shape coverage) are unchanged by this section.
 
+## 20. L1 capacity: reader kernel now streams weight in N-tile chunks instead
+    of keeping the whole packed blob resident
+
+Closed sec 13/14/18's remaining L1-capacity item. The reader kernel
+(`kernels/ternary_matmul/dataflow/reader_ternary_mm.cpp`) used to read the
+*entire* packed weight blob (`N*K/4 + 32` bytes) into one resident scratch
+CB up front - correct, but sized proportional to the whole weight tensor,
+which doesn't fit in L1 for real model dimensions. Checked against the
+actual `microsoft/BitNet-b1.58-2B-4T-gguf` weights this port has been
+validating against: `blk.0.ffn_gate`/`ffn_up` (N=6912, K=2560) need 4.3MB
+resident under the old scheme - a Blackhole Tensix core's L1 is on the order
+of 1.5MB total, so this was never going to fit outside ttsim (which doesn't
+enforce L1 capacity, only correctness), even though the sec 18 GGUF run
+"succeeded".
+
+**Fix**: the reader now fetches only one N-tile's row-block (32 rows x K/4
+bytes) per (mt, nt) pair, into a scratch CB sized for just that chunk,
+instead of the whole blob. This bounds L1 usage to a fixed size per weight
+tensor independent of N - 20-54KB across this model's projection matrices,
+an 80-216x reduction, comfortably fitting alongside the kernel's other CBs.
+The tradeoff: since the loop nesting stays mt-outer/nt-middle/kt-inner
+(unchanged, to keep matching the stock compute kernel's tile-consumption
+order - see sec 13/14), and the weight chunk doesn't depend on `mt`, it gets
+re-fetched from DRAM once per M-tile instead of once total - more DRAM
+traffic for less L1, the same kind of tradeoff the activation reads already
+made (sec 13's "redundant but simple" re-reads), and irrelevant on ttsim
+where performance isn't measured (sec 8/18).
+
+**Mechanism**: the weight tensor's DRAM buffer is still a single page
+spanning the whole tensor (buffer-type design from sec 9 - the two upstream
+tt-metal interior-`BufferRegion` bugs rule out multi-page host-side
+placement). That constraint is specific to *host*-facing
+`MeshCommandQueue` transfers, though - it says nothing about device-side NOC
+reads. `TensorAccessor::get_noc_addr(page_id, offset)` simply adds `offset`
+onto the page's base NOC address with no bounds checking against the page's
+nominal size (confirmed by reading `InterleavedAddrGen::get_addr` and the
+non-interleaved `TensorAccessor::get_noc_addr` in tt-metal's
+`tensor_accessor.h`/`dataflow_api_addrgen.h` - both are a plain offset add).
+So `weight_accessor.get_noc_addr(0, nt * chunk_bytes)` followed by a plain
+`noc_async_read` of `chunk_bytes` gives a correct, arbitrary-byte-range
+device-side read into that one page - entirely bypassing the buggy
+`SDMeshCommandQueue` code path (sec 9's bugs are host<->device transfer
+bugs, not NOC-level ones), no host-side buffer-type change needed.
+
+**Verified under ttsim**: re-ran the sec 18/19 GGUF command
+(`llama-cli -m <I2_S GGUF> -ngl 99 -dev TT_METALIUM0 --single-turn`) after
+the fix - clean run, real generated text, exit code 0, comparable throughput
+to sec 19's baseline (14.2 t/s prompt / 1.3 t/s generation vs. 13.4/1.3) -
+consistent with the fix being a pure L1-footprint change with no effect on
+the computed result, not a correctness change.
+
+**Not addressed here**: the per-superblock redundancy within a chunk (4
+consecutive `kt` values sharing the same 32 bytes/row are still read as part
+of the same chunk, not deduplicated further - already implicitly handled
+since the chunk covers the whole N-tile row, not per-kt) and any true
+double-buffered/prefetched streaming (the current chunk read is a blocking
+`noc_async_read_barrier()` before use, same synchronous style as the rest of
+this kernel) are both left as possible follow-up performance work, out of
+scope while performance is explicitly deferred to real silicon (sec 8/18).
+
 

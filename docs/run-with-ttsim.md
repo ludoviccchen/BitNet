@@ -214,11 +214,15 @@ Full detail in `PORTING_PLAN.md` §9, §13-19; summary:
   until real hardware exists (`PORTING_PLAN.md` §8).
 - **Only one prompt/shape tested end to end**: longer generations, multiple
   prompts, batch>1 remain unverified.
-- **L1 capacity**: the ternary matmul kernel (Option B) reads the entire
-  packed weight blob into a resident L1 CB in one shot - correct for this
-  2B model (the test doesn't fail), but not yet verified at larger scale; a
-  chunked/streamed weight load is still needed before this scales to bigger
-  layers.
+- **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
+  (Option B) now streams one N-tile's packed weight row-block at a time
+  instead of keeping the whole blob resident, bounding L1 usage to 20-54KB
+  per weight tensor on this model regardless of tensor size (previously up
+  to 4.3MB for the largest FFN projections - more than a Blackhole core's
+  L1 budget, so the old whole-blob design would not have fit outside
+  ttsim). The tradeoff is more DRAM traffic (the weight chunk is re-fetched
+  once per M-tile); irrelevant while performance work stays deferred to
+  real silicon (§7 below).
 - **One `MeshBuffer` per root tensor, always accessed whole** - two
   tt-metal bugs (miscalculated host offset, "interior" writes/reads landing
   at offset 0) prevent direct access to a sub-region of a buffer. Views
