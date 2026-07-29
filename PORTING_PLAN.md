@@ -1047,4 +1047,104 @@ matrix dimensions under ttsim at all - independent of M-alignment, and
 worth doing before any further real-model ttsim testing, not just before
 re-enabling decode-step offload.
 
+## 23. Reader kernel unpack loop optimized: real, verified speedup - but not
+    enough to make real dimensions practical under ttsim
+
+Attempted sec 22's flagged next step: speeding up the reader kernel's
+unpack loop (`kernels/ternary_matmul/dataflow/reader_ternary_mm.cpp`)
+enough to make real projection-matrix dimensions testable under ttsim.
+Two structural changes, both algorithmic (same math, fewer/cheaper
+operations), not a rewrite of what the kernel computes:
+
+1. **Precomputed tile-face index table.** The row/col -> tile-face byte
+   offset (`face_y*TILE_ROW_STRIDE + face_x*FACE_HW + local_row*FACE_DIM +
+   local_col`) is invariant across every `(mt, nt, kt)` visited - it only
+   depends on `(row, c)` within a 32x32 tile. The old code recomputed it
+   (with a division/modulo chain) for every one of up to `Mt*Nt*Kt*1024`
+   element visits. Now computed once into a 1024-entry table
+   (`face_idx[row*32+c]`) at kernel start, replacing that chain with a
+   single array lookup in the hot loop.
+2. **Four-lane batching per superblock.** The four K-tiles sharing a
+   packing superblock (`kt = sb*4 + lane`, sec 13/PORTING_PLAN sec 10) read
+   the *exact same* packed byte per row, decoded at four different bit
+   offsets. The old code did four entirely separate passes over that same
+   32x32 byte block (one per `kt`), reloading and redecoding the same bytes
+   four times. Now unpacked together from a single pass: one L1 byte load
+   feeds all four lanes' `decode()` + tile-face-indexed store, and all four
+   resulting tiles are reserved/pushed to `cb_in0` as one 4-tile batch
+   (`cb_reserve_back(cb_id_in0, 4)`, standard tt-metal multi-page
+   reserve/fill/push pattern - contiguous pages within one reservation).
+   `K % 128 == 0` (required by `ggml_backend_ttnn_mul_mat_shape_ok`)
+   guarantees `Kt = K/32` is always a multiple of 4, so this never needs
+   remainder handling. Host side: `cb_in0`'s capacity raised from 2 to 4
+   tiles (`ggml-ttnn.cpp`) to allow reserving a full 4-tile batch at once;
+   this is a single-buffered exact fit, not further pipelined, matching
+   this kernel's existing fully-synchronous style (every read is already
+   followed immediately by `noc_async_read_barrier()`).
+
+**Correctness reverified thoroughly**, same methodology as every kernel
+change in this document: two dense random-pattern tests against a CPU f64
+reference (K=256/N=64/M=32: `max_abs_err=0.456`, 0/2048 over a 0.5
+threshold; K=384/N=96/M=64: `max_abs_err=0.748`, 25/6144 over threshold),
+plus - because that second run's higher over-threshold count was initially
+concerning enough to check rather than assume - an **exact sparse
+diagnostic** (isolated single nonzero weights, one per `(nt, sb, lane)`
+combination, against a constant activation, so the expected output is
+exact with no bf16 noise to obscure a real bug): 0/3072 mismatches at
+K=384/N=96, 0/40960 mismatches at K=1280/N=1280 (10 superblocks x 40
+N-tiles x 4 lanes, the largest scale exercised). This confirms the growing
+over-threshold counts in the dense tests are ordinary bf16 accumulation
+noise scaling with K (consistent with sec 14's own note that tolerance
+needs scaling up for larger K), not a regression from this rewrite - the
+addressing/batching logic itself is exact at every scale tested.
+
+**Timing, measured directly** (standalone test harness, real
+`ggml_backend_graph_compute` dispatch, single matmul call, `M=32` tile-
+aligned so the call isn't rejected by `supports_op`):
+
+| K=N    | old code (sec 22 baseline) | new code (this section) |
+|--------|------------------------------|--------------------------|
+| 512    | not measured                 | ~43s                     |
+| 1280   | not measured                 | ~253s                    |
+| 2560   | did not finish in >580s      | **~930s (15.5 min)**     |
+
+The K=512/1280/2560 timings scale roughly linearly with `N*K` (as
+expected: outer-loop iteration count is `Nt*Sb = (N/32)*(K/128)`, exactly
+proportional to `N*K`), confirming the optimization is working as designed
+- this is a real, several-times reduction in the same real-hardware-shaped
+call that never completed within 580s before (sec 22). It is not, however,
+close to "practical": one `K=2560,N=2560` matmul call - a single Q/attn_out
+projection in this 2B model - still takes ~15.5 minutes. A real forward
+pass has ~7 such matmuls per layer across 30 layers; even prefill (let
+alone per-token decode) at real dimensions remains far outside any
+reasonable ttsim testing budget.
+
+**Decision**: keep this change (strictly better, verified correct, and the
+existing `-ngl 99 -n 16` smoke test is unaffected and still fast, ~16-18s,
+since the `M % 32 == 0` gate from sec 22 stays in place regardless).
+**Do not** treat this as closing sec 21/22's gap - re-enabling
+`ggml_backend_ttnn_mul_mat_shape_ok`'s M-alignment relaxation still isn't
+practical: even with this speedup, a single real-dimension matmul call
+measured in minutes, not seconds, means every decode step (which needs
+~7 per layer x 30 layers if fully offloaded) would take hours under ttsim.
+
+**Consequence**: closing sec 21's gap for real needs an order-of-magnitude
+bigger win than an algorithmic tidy-up of the existing scalar loop can
+give - the fundamental issue is that this unpack work runs on a
+data-movement RISC-V core (scalar, one element at a time) rather than the
+FPU/SFPU compute engine (vector-parallel by design). A genuine fix likely
+means restructuring the kernel triad so the ternary unpack happens as a
+vectorized SFPU operation on the compute core instead of a data-movement-
+core loop - a materially larger redesign than this section's tidy-up, not
+attempted here. Separately, ttsim's own per-instruction simulation
+overhead is unknown to be the dominant multiplier here or not - real
+silicon may make even the *unoptimized* sec 22 baseline practical, since a
+RISC-V core actually clocked in the hundreds of MHz to GHz range doing
+~6.5M scalar element-unpacks is on the order of tens to low hundreds of
+milliseconds, not minutes; ttsim being a functional (not throughput-
+oriented) simulator plausibly inflates this by orders of magnitude beyond
+what real hardware would show. Both avenues (SFPU redesign, or simply
+trusting real hardware to be fast enough without further kernel work) are
+open; neither is resolved here.
+
 

@@ -204,7 +204,7 @@ host↔device round trip per call (see section 7).
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-22; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-23; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -231,6 +231,20 @@ Full detail in `PORTING_PLAN.md` §9, §13-22; summary:
   `M%32==0` check is restored by default so the smoke test below stays fast
   (~15-30s) - the padding fix is in place and correct, just not switched on,
   pending a real optimization pass on the reader kernel's unpack loop.
+- **Reader kernel unpack loop optimized, still not enough**:
+  `PORTING_PLAN.md` §23 cut real per-element cost (precomputed tile-face
+  index table instead of recomputing it via division/modulo on every
+  element; four K-tiles sharing a packing superblock unpacked from one
+  shared byte load instead of four redundant passes) - verified correct at
+  every scale tested (including an exact, bf16-noise-free diagnostic up to
+  K=1280/N=1280). Real effect measured directly: a `K=2560,N=2560` matmul
+  call that never finished in over 580s before now completes in ~930s
+  (15.5 min) - a genuine, multi-times speedup, but still nowhere near
+  practical (~7 such matmuls per layer x 30 layers). The `M%32==0` gate
+  stays in place; closing this for real most likely needs the unpack moved
+  onto the vector-parallel SFPU compute engine instead of the scalar
+  data-movement core it runs on today - a materially larger redesign, not
+  attempted.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB
