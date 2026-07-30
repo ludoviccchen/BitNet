@@ -204,7 +204,7 @@ host↔device round trip per call (see section 7).
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-23; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-24; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -231,20 +231,33 @@ Full detail in `PORTING_PLAN.md` §9, §13-23; summary:
   `M%32==0` check is restored by default so the smoke test below stays fast
   (~15-30s) - the padding fix is in place and correct, just not switched on,
   pending a real optimization pass on the reader kernel's unpack loop.
-- **Reader kernel unpack loop optimized, still not enough**:
-  `PORTING_PLAN.md` §23 cut real per-element cost (precomputed tile-face
-  index table instead of recomputing it via division/modulo on every
-  element; four K-tiles sharing a packing superblock unpacked from one
-  shared byte load instead of four redundant passes) - verified correct at
-  every scale tested (including an exact, bf16-noise-free diagnostic up to
-  K=1280/N=1280). Real effect measured directly: a `K=2560,N=2560` matmul
-  call that never finished in over 580s before now completes in ~930s
-  (15.5 min) - a genuine, multi-times speedup, but still nowhere near
-  practical (~7 such matmuls per layer x 30 layers). The `M%32==0` gate
-  stays in place; closing this for real most likely needs the unpack moved
-  onto the vector-parallel SFPU compute engine instead of the scalar
-  data-movement core it runs on today - a materially larger redesign, not
-  attempted.
+- **Reader kernel unpack loop optimized (scalar tidy-up), still not
+  enough**: `PORTING_PLAN.md` §23 cut real per-element cost (precomputed
+  tile-face index table instead of recomputing it via division/modulo on
+  every element; four K-tiles sharing a packing superblock unpacked from
+  one shared byte load instead of four redundant passes) - verified
+  correct at every scale tested. Real effect measured directly: a
+  `K=2560,N=2560` matmul call that never finished in over 580s before now
+  completes in ~930s (15.5 min) - a genuine speedup, but nowhere near
+  practical.
+- **Unpack moved to the SFPU - ~6x faster, still not enough for full
+  offload**: `PORTING_PLAN.md` §24 went further than §23's scalar tidy-up:
+  the actual 2-bit decode now runs as vectorized SFPU ops (bitwise AND,
+  shift, typecast, subtract) on the Tensix compute engine, not a scalar
+  loop on the data-movement RISC-V core - the reader's only job now is
+  gathering undecoded raw bytes. Found and fixed a real concurrency
+  deadlock along the way (an activation-tile circular buffer sized for the
+  old design blocked forever once a matmul call needed more than one
+  packing superblock - see §24 for the full mechanism). Verified correct
+  (dense random + an exact sparse diagnostic, both matching §23's own
+  numbers almost to the bit) and measured ~6x faster: the same
+  `K=2560,N=2560` call that took ~930s under §23 now completes in ~154s.
+  Still not practical for full decode-step offload (~7 such calls per
+  layer x 30 layers), so the `M%32==0` gate from §21/22 stays in place -
+  but this is a real architectural win verified end to end, and since
+  ttsim's absolute numbers are known not to represent real hardware
+  timing, trading scalar RISC-V work for vector SFPU work plausibly
+  matters more on real silicon than these numbers alone suggest.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB

@@ -1147,4 +1147,125 @@ what real hardware would show. Both avenues (SFPU redesign, or simply
 trusting real hardware to be fast enough without further kernel work) are
 open; neither is resolved here.
 
+## 24. The SFPU redesign: real, verified ~6x speedup - plus a genuine
+    concurrency deadlock found and fixed along the way
+
+Attempted sec 23's flagged "real fix": move the ternary unpack off the
+scalar data-movement RISC-V core entirely, onto the Tensix compute core's
+SFPU (a vector engine), rather than continuing to tune the scalar loop.
+
+**Feasibility research first** (no precedent existed for this exact
+combination in-tree): tt-metal's compute-kernel API has documented,
+LLK-backed SFPU ops for exactly what this needs -
+`bitwise_and_tile`/`right_shift_tile` (Int32/UInt32/UInt16 tiles),
+`typecast_tile` (UInt16 <-> Float16_b is a supported direct path), and
+`sub_unary_tile` (fp32 scalar subtract). No hardware "unpacker" shortcut
+exists for a bare 2-bit code on Wormhole/Blackhole (`DataFormat`'s only
+narrow-int support, `MxInt2`, is gated on the unreleased Quasar
+architecture) - the shift/mask/typecast has to run as real SFPU
+instructions. `tt_metal/programming_examples/sfpu_eltwise_chain/` gave the
+structural template (`tile_regs_acquire` -> `copy_tile` -> chained
+`op_init()`/`op()` calls -> `tile_regs_commit`/`pack_tile`); reading
+`ttnn/.../moreh_sum`'s h-reduction kernel confirmed a single compute kernel
+file can legitimately be both producer and consumer of an intermediate CB
+(needed here: `cb_in0` is produced by the new SFPU phase and consumed by
+the matmul phase, both within `compute/mm.cpp`).
+
+**Design** (`kernels/ternary_matmul/`):
+- The reader (`dataflow/reader_ternary_mm.cpp`) got *simpler*, not just
+  smaller: it now gathers one **shared, undecoded** raw-byte tile per
+  superblock (not per lane) into a new CB (`cb_raw`, `UInt16` format -
+  the bitwise/shift SFPU ops require Int32/UInt32/UInt16, not `UInt8`) -
+  1024 scalar byte-copies per superblock, a 4x reduction from sec 23's
+  four-lanes-duplicated version, since all four lanes now decode from the
+  *same* shared tile instead of the reader writing it four times.
+- `compute/mm.cpp` gained a Phase 1 (per superblock, one `tile_regs`
+  acquire/commit/release cycle per lane): `copy_tile` the shared raw tile
+  into DST, `right_shift_tile(6-2*lane)` + `bitwise_and_tile(0x3)` isolate
+  that lane's 2-bit code, `typecast_tile<UInt16,Float16_b>` converts it to
+  a float, `sub_unary_tile(1.0f)` lands on the actual value - the
+  code->value mapping (sec 10) is exactly `value = code - 1`, so no lookup
+  table is needed on the SFPU side, just one subtract. Phase 2 (the stock
+  FPU accumulation loop) is byte-for-byte unchanged from every earlier
+  version of this kernel. `reconfig_data_format_srca` /
+  `copy_tile_to_dst_init_short` / `matmul_init` are re-issued at each
+  phase transition to reprogram the unpack/math hardware state between the
+  two different CB formats and op types in play (same pattern used by
+  `moreh_sum`'s mixed-op kernel).
+- Host side (`ggml-ttnn.cpp`): new `cb_raw` CB (`UInt16`, 1-tile capacity -
+  the reader/compute handshake for it is single-buffered, matching this
+  kernel's fully-synchronous style everywhere else); `cb_in0` resized from
+  a 4-tile batch to a full `Kt`-tile queue, since Phase 1 now produces all
+  of a tile's K-dimension decode *before* Phase 2 starts draining it (not
+  interleaved - matmul's accumulation holds one open `tile_regs` session
+  across the whole Kt loop, which cannot be interrupted by Phase 1's own
+  per-lane sessions without corrupting the in-progress accumulation).
+
+**A real concurrency bug, found and fixed**: initial testing at K=128 (a
+single superblock) passed cleanly first try - correct output, ~1s. Scaling
+to K=256 (two superblocks) hung indefinitely (no completion within 280s,
+versus a fraction of a second of actual compute at K=128). Isolated with
+two synthetic shapes that separately vary only one dimension
+(K=128/N=64, multiple N-tiles/single superblock: fine, ~1.8s; K=256/N=32,
+single N-tile/multiple superblocks: hangs) - conclusively tied to
+*multiple superblocks*, not multiple N-tiles. Ruled out a `cb_in0`
+off-by-one sizing theory by over-provisioning it (no change). Root cause,
+once found: `cb_in1` (activation tiles) was left at its old 2-tile
+double-buffered capacity, but - unlike every earlier version of this
+kernel - Phase 2 is now the *only* consumer of `cb_in1`, and Phase 2 does
+not start until Phase 1's entire superblock loop finishes (program order
+within one compute kernel). The reader, a separate concurrently-running
+core, pushes activation tiles for superblock 0 into `cb_in1` faster than
+anything drains them; once it fills `cb_in1`'s 2 slots, the reader blocks
+- and since the reader's own loop pushes a superblock's `cb_in1` tiles
+*before* moving on to request the *next* superblock's `cb_raw` tile,
+Phase 1 (which needs that next `cb_raw` tile to proceed) stalls too. A
+three-way circular wait: reader -> blocked on `cb_in1` space -> which only
+Phase 2 frees -> which only starts after Phase 1 finishes -> which needs
+the reader's next `cb_raw` push -> which the reader can't reach. Single
+superblock shapes never hit this (no "next superblock" to block on) - the
+same "invisible until problem size > 1" pattern this document has hit
+repeatedly (sec 14, sec 21). Fixed by sizing `cb_in1` to `Kt` tiles too,
+the same reasoning already applied to `cb_in0`.
+
+**Correctness reverified after the fix**, same methodology as every
+kernel change in this document: dense random tests at K=256/384/512
+(N=32/96/512) all match sec 23's own numbers on the same shapes almost to
+the bit (e.g. K=512/N=512/M=32: `max_abs_err=0.909066`, `mean=0.137053`,
+`233/16384` over threshold - identical to sec 23's measurement of the
+same shape), plus a full exact sparse diagnostic at K=384/N=96 (36 probes,
+every `(nt, sb, lane)` combination): 0/110592 mismatches.
+
+**Timing, measured directly, same standalone harness as sec 22/23**:
+
+| K=N    | sec 23 (scalar, optimized) | sec 24 (SFPU)      | speedup |
+|--------|------------------------------|---------------------|---------|
+| 1280   | ~253s                        | ~44s                | ~5.7x   |
+| 2560   | ~930s                        | ~154s (2m34s)       | ~6.0x   |
+
+Both K=1280 and K=2560 SFPU runs reproduce sec 23's exact error metrics
+(`max_abs_err`, `mean_abs_err`, over-threshold counts all identical to
+several decimal places) - confirming this is a pure performance change,
+not a numerics change, consistent with Phase 2's FPU accumulation being
+byte-for-byte the same code as before.
+
+**Still not "practical"**: ~154s for one real-dimension matmul call means
+a full 30-layer forward pass (~7 such calls/layer if every projection were
+this size) would still take on the order of hours under ttsim, not
+seconds - `ggml_backend_ttnn_mul_mat_shape_ok`'s `M % 32 == 0` gate stays
+in place (sec 21/22 unchanged); this does not make re-enabling decode-step
+offload viable under ttsim. What it does establish: the SFPU redesign is
+functionally correct and a real, substantial (~6x) win over further
+scalar tuning, verified end to end including a genuine concurrency bug
+that would have been very hard to find without the same small-scale-first
+methodology this whole document has used throughout. Since ttsim's
+absolute numbers are repeatedly not a real-hardware performance proxy
+(sec 8/18/23), and this specific change trades scalar RISC-V instructions
+for vector SFPU ones - the kind of change real silicon's actual clock-rate
+parallelism should reward far more than a slow functional simulator can
+show - it remains plausible (not verified) that this redesign matters more
+on real hardware than the ttsim numbers alone suggest.
+
+
+
 
