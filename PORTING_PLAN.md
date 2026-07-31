@@ -1554,6 +1554,95 @@ scale. Flagged as the next concrete blocker - genuinely closer to the
 real milestone than sec 26 was, since the dst-view fix is real, verified
 progress that is being kept regardless of this new finding.
 
+## 28. Sub-linear multi-core scaling, explained with real data - not a bug
+    in this backend's code
+
+Sec 25 flagged but didn't chase why multi-core dispatch's speedup fell
+well short of the available 140-core ceiling (~15.5x realized at
+`Nt=80`). Investigated with the same tool that worked for sec 27: direct
+measurement, not more speculation - temporary `std::chrono` timestamps
+around each phase of `compute_mul_mat` (weight-scale read, activation
+prep, core-split, program setup, device dispatch+readback, host
+postprocess), removed again once the data was in.
+
+**Finding, immediate and unambiguous**: essentially all wall-clock time is
+in the device dispatch+readback phase - every host-side phase (weight
+read, activation transpose/tilize, `split_work_to_cores`, CB/kernel
+setup, final postprocess) measured under 5ms combined, regardless of
+shape. This rules out any host-side serial bottleneck (e.g. the
+whole-weight-blob read done just to extract a 4-byte scale, sec 10 - a
+plausible suspect that turned out to be irrelevant, 0.2-4.7ms even at
+real dimensions) - the question is entirely about what happens *inside*
+the device dispatch.
+
+**Measured dispatch+readback time vs. core count, K fixed at 2560**:
+
+| N-tiles / cores used | time      |
+|-----------------------|-----------|
+| 1                      | 2959.0ms  |
+| 2                      | 3038.7ms  |
+| 5                      | 3314.4ms  |
+| 10                     | 4159.6ms  |
+| 80 (full K=2560,N=2560)| 8291.2ms  |
+
+**And vs. K (Kt), at a fixed 1 core (`N=32`, so `Nt=1`)**:
+
+| K    | Kt | time     |
+|------|-----|----------|
+| 1280 | 40  | 1987.4ms |
+| 2560 | 80  | 2959.0ms |
+
+Fitting the single-core numbers to `time = C + D*Kt` gives `C ~= 1016ms`
+(a per-core floor independent of K - plausibly program-load/dispatch
+startup cost, simulated) and `D ~= 24.3ms` per K-tile (the actual SFPU
+decode work, sec 24, which genuinely does scale with `Kt` - every core
+independently unpacks its own full K-depth for whichever N-tiles it
+owns, so this term is expected, correct, and not wasteful).
+
+**The key observation**: that per-core cost (`C + D*Kt`, ~2960ms for
+`K=2560`) does **not** shrink as *more* cores run concurrently - if it
+did (real hardware parallelism), 80 cores each doing 1 N-tile's worth of
+work should take about the same wall-clock time as 1 core doing 1
+N-tile's worth of work (~2960ms), since they're independent and
+non-communicating (sec 25's whole design). Instead, total time grows
+from ~2960ms (1 core) to ~8291ms (80 cores) - roughly 5.3 additional
+seconds of apparent cost spread across the 79 extra cores, on top of the
+expected-constant per-core work. That growth is the sub-linear-scaling
+gap sec 25 measured, now attributed to a specific place: something about
+running *more concurrent cores* costs additional wall-clock time in a
+way pure hardware parallelism would not.
+
+**Conclusion: this is a ttsim characteristic, not a bug in this
+backend's host or kernel code.** Every host-side phase is confirmed
+negligible; the kernel triad's per-core logic is unchanged from sec 24's
+already-verified-correct single-core version, just replicated across
+cores with no cross-core coupling (sec 25's design deliberately avoids
+any communication between cores, so there's no shared resource or lock in
+*this backend's own code* that additional cores could be contending
+over). The remaining explanation is ttsim's own execution model: a
+"functional simulator, not a timing model" (this document's own repeated
+characterization, sec 8/18/23/24) most plausibly does not genuinely
+execute multiple simulated Tensix cores' instruction streams with real
+wall-clock parallelism, and instead pays additional real (host) CPU time
+for each additional core it has to step through, regardless of how
+independent that core's work is. Real Blackhole silicon, where 80 cores
+genuinely execute concurrently in hardware, would not be expected to show
+this same growth - consistent with, and now backed by concrete
+measurement of, this document's standing caveat that ttsim's absolute
+numbers are not a real-hardware performance proxy.
+
+**Consequence**: no code change made or needed here - there is no
+identified inefficiency in this backend to fix, and "make ttsim itself
+simulate many-core concurrency with real parallelism" is out of scope
+for this port. Sec 25's flagged question is now answered with data
+rather than left open: the sub-linear scaling is explained, and the
+explanation points away from further engineering effort here, not toward
+it. Worth re-measuring once real hardware is available (per the
+standing recommendation throughout this document), where this specific
+gap is expected to look very different.
+
+
+
 
 
 

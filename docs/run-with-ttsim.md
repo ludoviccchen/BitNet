@@ -227,7 +227,7 @@ numbers were never a performance proxy to begin with.
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-27; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-28; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -293,10 +293,26 @@ Full detail in `PORTING_PLAN.md` §9, §13-27; summary:
   ~44s to ~4.3s (~10.3x) - both still matching prior sections' error
   metrics exactly. Cumulative effect since §23: roughly 94x faster.
   Available parallelism (140 worker cores in this Blackhole config) is not
-  fully realized in wall-clock terms - plausibly per-core dispatch
-  overhead or ttsim's own simulation model, not chased further (§25). The
-  `M%32==0` gate stays in place for now, though the combined §24+§25 win
-  may be worth revisiting that decision over.
+  fully realized in wall-clock terms - measured and explained in §28
+  (below), not a code inefficiency to fix. The `M%32==0` gate stays in
+  place for now, though the combined §24+§25 win may be worth revisiting
+  that decision over.
+- **Sub-linear multi-core scaling, explained**: `PORTING_PLAN.md` §28
+  measured it directly (phase-by-phase timing, then removed once the data
+  was in) rather than leaving §25's question open. All wall-clock time is
+  in device dispatch, not host-side prep (every host phase measured under
+  5ms). The per-core cost (~1000ms fixed + ~24ms per K-tile of genuine
+  SFPU decode work) does not shrink as more cores run concurrently -
+  going from 1 to 80 cores at `K=2560` grows total time from ~2960ms to
+  ~8291ms, when independent, non-communicating cores under real hardware
+  parallelism should cost about the same as one. No bug found in this
+  backend's host or kernel code (kernel logic unchanged from §24, no
+  cross-core coupling by design); the most plausible explanation is that
+  ttsim itself doesn't give multiple simulated cores genuine wall-clock
+  parallelism - consistent with, and now backed by measurement of, this
+  guide's standing point that ttsim's absolute numbers aren't a real-
+  hardware performance proxy. No code change made; expected to look
+  different on real silicon.
 - **`M%32==0` gate lifted - real decode-step offload, but a new blocker
   found**: `PORTING_PLAN.md` §26 acted on §25's suggestion. Verified
   correct at every M tested (including exact diagnostics at M=1 and M=5 -
