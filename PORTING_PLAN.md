@@ -1467,6 +1467,95 @@ isolated repro before touching this code again, not a fix attempted
 inside an already-long real-model run. Flagged as the concrete next
 blocker, not resolved here.
 
+## 27. The dst-view blocker, actually root-caused and fixed - real progress,
+    plus a new, deeper blocker found
+
+Picked up sec 26's flagged next step: root-cause the `dst must not be a
+view` assert properly, with a real repro, instead of guessing.
+
+**Root-caused empirically**, not by further reading of ggml internals in
+the abstract: added temporary debug instrumentation to `compute_mul_mat`
+printing `dst`'s pointer, `view_src`, `ggml_nbytes(dst)`, and the located
+buffer's resolved offset/size, then re-ran the real failing case. Two
+consecutive nodes told the whole story:
+
+```
+dst=0x...aaf0 name=Qcur-0 view_src=(nil) ggml_nbytes(dst)=20480 located.offset=0 located.buffer->size()=20480  N=2560 M=2
+dst=0x...add0 name=Vcur-0 view_src=(nil) ggml_nbytes(dst)=5120  located.offset=0 located.buffer->size()=20480  N=640  M=2
+```
+
+`Vcur-0` is **not** a view (`view_src` is null, `root == dst`, offset is
+correctly 0) - but its registered buffer is sized `20480` bytes, matching
+`Qcur-0`'s size exactly, not its own `5120`. Root cause: ggml's graph
+allocator (`ggml-alloc.c`) recycles a scratch tensor's raw address for a
+later, differently-sized tensor once the earlier one is dead
+(`ggml_gallocr_free_node` / `ggml_gallocr_allocate_node`'s address reuse) -
+and does this via `ggml_vbuffer_tensor_alloc` setting `tensor->data`
+directly, which does **not** always call this backend's `init_tensor`
+callback again. This backend's per-address `MeshBuffer` registry
+(`ctx->tensor_buffers`, keyed by raw `tensor->data` value, sec 9) then
+keeps returning the stale entry from whatever tensor last legitimately
+registered that address - `Qcur-0`'s 20480-byte buffer, not a fresh one
+sized for `Vcur-0`. The name "dst must not be a view" was accurate for
+the mechanism this assert was originally written to catch (sec 16) but
+misleading for what was actually happening here: no view was involved at
+all, just a stale registration this backend never noticed had gone
+out of date.
+
+**Fix**: `ggml_backend_ttnn_locate()` now detects this directly - if the
+registered buffer's size doesn't match `root`'s *current* `ggml_nbytes`,
+that mismatch itself proves the address was recycled since the entry was
+created (a live, non-recycled registration always matches exactly, as
+`Qcur-0` did), so it re-creates a fresh, correctly-sized `MeshBuffer` on
+the spot (the same construction logic `init_tensor` uses, factored into a
+shared `ggml_backend_ttnn_alloc_tensor_buffer` helper) rather than trusting
+the stale entry. This fixes the root cause at the one place every access
+path goes through (`locate()`), not just the `compute_mul_mat` dst call
+site sec 26's reverted attempt special-cased - `get_tensor`/`set_tensor`/
+`memset_tensor` and the view-sanity-check in `init_tensor` itself all
+benefit the same way, for the same reason. The `compute_mul_mat` asserts
+stay (still correctly catch a *genuine* nonzero-offset view, which Option
+B's direct on-device addressing still cannot support) but their stale-size
+false-positive is gone.
+
+**Re-verified**: dense random and exact sparse diagnostics at every M
+tested (1, 5) - `max_abs_err`/mismatch counts identical to sec 26's
+pre-fix numbers, confirming no regression.
+
+**Real end-to-end run: got dramatically further, then hit a different,
+new failure.** `llama-cli -ngl 99 -n 1 --single-turn` - previously aborted
+in 14 seconds (sec 26's revert) or 3m37s (the very first attempt, before
+that) - this time ran for **93 minutes** before failing, further into
+real computation than anything in this entire porting effort has ever
+reached (no `GGML_ASSERT` in the log - the dst-view issue genuinely did
+not recur). It then hit a `SIGSEGV` (address `0x58`, i.e. a near-null
+pointer dereference - not one of this backend's own asserts) inside
+tt-metal's `SDMeshCommandQueue::read_shard_from_device`, reached via
+`wait_for_cores_idle` -> `get_core_type`, called from this backend's own
+`ggml_backend_ttnn_read_whole`.
+
+**Not chased further in this session**: each reproduction cycle costs
+~90+ minutes, and there isn't yet a cheap, isolated way to test a
+hypothesis about this new failure the way the debug-print approach did
+for the dst-view bug - it only manifests this deep into sustained,
+long-running multi-core kernel dispatch (sec 25), a regime nothing in
+this port has exercised before (every earlier real-model attempt failed
+within seconds to minutes, well before reaching whatever state this
+requires). Plausible, unconfirmed causes: a `MeshBuffer` lifetime
+interaction with sec 27's own fix (though local `shared_ptr`s in
+`compute_mul_mat` should keep any buffer alive for the duration of the
+call that resolved it, so this isn't obviously implicated); a genuinely
+separate, pre-existing tt-metal/ttsim internal issue that only surfaces
+after enough cumulative kernel dispatches (in the spirit of sec 11's
+`MeshDevice`-destroy bug - another case of tt-metal-internal state that
+degrades under conditions this port was first to exercise); or something
+particular to this run's specific KV-cache/decode-step access pattern at
+scale. Flagged as the next concrete blocker - genuinely closer to the
+real milestone than sec 26 was, since the dst-view fix is real, verified
+progress that is being kept regardless of this new finding.
+
+
+
 
 
 

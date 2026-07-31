@@ -185,30 +185,31 @@ offload. To exercise the backend, invoke `llama-cli` directly:
   §19). Passing it still forces the KV-cache onto CPU; that remains a valid
   configuration if you want to compare, not a required workaround.
 
-**Known issue: this command currently aborts, not just runs slowly.**
-Since `PORTING_PLAN.md` §26, `MUL_MAT` offload is no longer gated on `M`
-being tile-aligned - decode-step matmuls genuinely reach `TT_METALIUM0`
-now, confirmed via `GGML_SCHED_DEBUG` and extensive standalone (isolated
-matmul) testing at every real projection shape. But a real multi-layer
-model graph hits a *different*, pre-existing gap this surfaces for the
-first time: `GGML_ASSERT(... "ggml-ttnn: mul_mat dst must not be a view")`
-- ggml's graph allocator's normal buffer-reuse produces a `MUL_MAT` output
-tensor that shares a device buffer with something else, which this
-backend's `compute_mul_mat` doesn't yet handle (a deliberate sec 16
-decision to fail loudly rather than silently misbehave, that just never
-fired before because so few `MUL_MAT` nodes reached this backend). A first
-attempt at fixing it traded that loud assert for a *silent heap
-corruption* bug instead, so it was reverted rather than shipped - see §26
-for the full story. **Until this is fixed**, expect the command above to
-abort partway through a real run rather than complete; the per-shape
-correctness and timing numbers in §26 come from the standalone kernel
+**Known issue: this command currently does not complete.** Since
+`PORTING_PLAN.md` §26, `MUL_MAT` offload is no longer gated on `M` being
+tile-aligned - decode-step matmuls genuinely reach `TT_METALIUM0` now,
+confirmed via `GGML_SCHED_DEBUG` and extensive standalone (isolated
+matmul) testing at every real projection shape. A real multi-layer model
+graph originally hit a *different*, pre-existing gap this surfaced for
+the first time (`GGML_ASSERT(... "mul_mat dst must not be a view")`) -
+**root-caused and fixed in §27**: ggml's graph allocator recycles a dead
+scratch tensor's raw address for a later, differently-sized tensor
+without always calling this backend's `init_tensor` callback again,
+leaving a stale, wrongly-sized entry in this backend's per-address buffer
+registry (nothing to do with an actual view). With that fixed, the same
+command ran for **93 minutes** - dramatically further than ever before -
+before hitting a *different*, not-yet-root-caused `SIGSEGV` inside
+tt-metal's `read_shard_from_device`, only reachable this deep into
+sustained real execution (see §27). **Until that's resolved**, expect the
+command above to eventually crash rather than complete; the per-shape
+correctness and timing numbers in §26/§27 come from the standalone kernel
 harness, not a completed end-to-end `llama-cli` run.
 
 Actual output observed in this environment (section 2 variables exported,
 section 5 model in place, from an earlier `-n 16` run before §26's change,
-back when the `M%32==0` gate kept most decode-step matmuls on CPU and this
-assert was never reached - kept here as a correctness/output-shape
-reference, not a currently-reproducible example):
+back when the `M%32==0` gate kept most decode-step matmuls on CPU and
+neither of the above was ever reached - kept here as a correctness/
+output-shape reference, not a currently-reproducible example):
 
 ```
 > You are a helpful assistant
@@ -226,7 +227,7 @@ numbers were never a performance proxy to begin with.
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-26; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-27; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -306,10 +307,22 @@ Full detail in `PORTING_PLAN.md` §9, §13-26; summary:
   versus §21's finding of 0% before). Real per-shape M=1 timing: ~3-19s
   per projection depending on shape, ~62s/layer, ~31 min/token if fully
   offloaded - not fast, but no longer "many hours." **However**: a real
-  end-to-end run hits a separate, pre-existing gap
-  (`dst must not be a view`, sec 16) that this change is the first thing
-  to actually surface - not resolved, see the known issue in §6 and the
-  full story in §26.
+  end-to-end run hit a separate, pre-existing gap
+  (`dst must not be a view`, sec 16) that this change was the first thing
+  to actually surface - see §27.
+- **dst-view assert root-caused and fixed; a new, deeper blocker found**:
+  `PORTING_PLAN.md` §27 diagnosed §26's blocker directly (debug
+  instrumentation on a real run, not guesswork): not an actual view, but
+  ggml's graph allocator recycling a dead tensor's address for a new,
+  differently-sized one without always re-invoking this backend's
+  `init_tensor` - `ggml_backend_ttnn_locate()` now self-heals that by
+  size-mismatch detection. Verified no regression, and the real
+  `llama-cli -ngl 99 -n 1` run went from aborting in 14s to running for
+  **93 minutes** - further into real computation than anything in this
+  port's history - before hitting a *different*, not-yet-root-caused
+  `SIGSEGV` inside tt-metal's `read_shard_from_device`. Each reproduction
+  costs ~90+ minutes, so not chased further yet - see the known issue in
+  §6 and the full story in §27.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB
