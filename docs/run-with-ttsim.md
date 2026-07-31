@@ -170,7 +170,7 @@ offload. To exercise the backend, invoke `llama-cli` directly:
 ./build/bin/llama-cli \
   -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
   -p "You are a helpful assistant" \
-  -n 16 -t 2 --single-turn \
+  -n 1 -t 2 --single-turn \
   -ngl 99 -dev TT_METALIUM0
 ```
 
@@ -185,8 +185,30 @@ offload. To exercise the backend, invoke `llama-cli` directly:
   §19). Passing it still forces the KV-cache onto CPU; that remains a valid
   configuration if you want to compare, not a required workaround.
 
+**Known issue: this command currently aborts, not just runs slowly.**
+Since `PORTING_PLAN.md` §26, `MUL_MAT` offload is no longer gated on `M`
+being tile-aligned - decode-step matmuls genuinely reach `TT_METALIUM0`
+now, confirmed via `GGML_SCHED_DEBUG` and extensive standalone (isolated
+matmul) testing at every real projection shape. But a real multi-layer
+model graph hits a *different*, pre-existing gap this surfaces for the
+first time: `GGML_ASSERT(... "ggml-ttnn: mul_mat dst must not be a view")`
+- ggml's graph allocator's normal buffer-reuse produces a `MUL_MAT` output
+tensor that shares a device buffer with something else, which this
+backend's `compute_mul_mat` doesn't yet handle (a deliberate sec 16
+decision to fail loudly rather than silently misbehave, that just never
+fired before because so few `MUL_MAT` nodes reached this backend). A first
+attempt at fixing it traded that loud assert for a *silent heap
+corruption* bug instead, so it was reverted rather than shipped - see §26
+for the full story. **Until this is fixed**, expect the command above to
+abort partway through a real run rather than complete; the per-shape
+correctness and timing numbers in §26 come from the standalone kernel
+harness, not a completed end-to-end `llama-cli` run.
+
 Actual output observed in this environment (section 2 variables exported,
-section 5 model in place):
+section 5 model in place, from an earlier `-n 16` run before §26's change,
+back when the `M%32==0` gate kept most decode-step matmuls on CPU and this
+assert was never reached - kept here as a correctness/output-shape
+reference, not a currently-reproducible example):
 
 ```
 > You are a helpful assistant
@@ -196,15 +218,15 @@ Exiting...
 ```
 
 The quality of the generated text doesn't matter here (a 2B-parameter model,
-16 tokens, no sampling tuning) - what matters is that the offload pipeline
-runs without asserting/crashing, which is all this port validates at this
-stage. Expect slow generation (~1 t/s): ttsim is a functional simulator, not
-a performance model, and every offloaded `mul_mat`/`SET_ROWS` does a
-host↔device round trip per call (see section 7).
+no sampling tuning) - what matters is that the offload pipeline runs
+without asserting/crashing, which - per the known issue above - it
+currently does not once `M` is unconstrained. See §26 for current,
+real per-projection standalone timing, and §7 for why ttsim's absolute
+numbers were never a performance proxy to begin with.
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-25; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-26; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -274,6 +296,20 @@ Full detail in `PORTING_PLAN.md` §9, §13-25; summary:
   overhead or ttsim's own simulation model, not chased further (§25). The
   `M%32==0` gate stays in place for now, though the combined §24+§25 win
   may be worth revisiting that decision over.
+- **`M%32==0` gate lifted - real decode-step offload, but a new blocker
+  found**: `PORTING_PLAN.md` §26 acted on §25's suggestion. Verified
+  correct at every M tested (including exact diagnostics at M=1 and M=5 -
+  genuinely new coverage, since no §24/§25 test had ever exercised the
+  M-padding logic's real zero-fill path before) and confirmed via
+  `GGML_SCHED_DEBUG` that decode-step `MUL_MAT` now actually reaches
+  `TT_METALIUM0` (2730 nodes on-device vs 673 CPU in one partial run,
+  versus §21's finding of 0% before). Real per-shape M=1 timing: ~3-19s
+  per projection depending on shape, ~62s/layer, ~31 min/token if fully
+  offloaded - not fast, but no longer "many hours." **However**: a real
+  end-to-end run hits a separate, pre-existing gap
+  (`dst must not be a view`, sec 16) that this change is the first thing
+  to actually surface - not resolved, see the known issue in §6 and the
+  full story in §26.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB

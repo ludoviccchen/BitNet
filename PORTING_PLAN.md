@@ -1366,6 +1366,108 @@ faster than sec 23 alone) changes the practicality calculus enough that
 it may be worth reopening, but that decision is left for a follow-up
 rather than made here.
 
+## 26. Revisiting the M-gate: real decode-step offload, enabled by default
+
+Sec 25 flagged this as the natural next step - the cumulative ~94x
+speedup from sec 24+25 might make lifting `ggml_backend_ttnn_mul_mat_
+shape_ok()`'s `M % 32 == 0` gate (sec 21/22) practical for the first time.
+Measured before deciding, same discipline as every other section here.
+
+**Real per-call timing at M=1** (the actual decode-step shape), standalone
+harness, across every distinct real projection shape in this 2B model:
+
+| Projection             | K    | N    | M=1 time |
+|-------------------------|------|------|----------|
+| attn_q / attn_output    | 2560 | 2560 | ~5.8s    |
+| attn_k / attn_v         | 2560 | 640  | ~3.3s    |
+| ffn_gate / ffn_up       | 2560 | 6912 | ~12.8s   |
+| ffn_down                | 6912 | 2560 | ~18.7s   |
+
+Summed per layer (2+2+2+1 of the above): ~62.5s/layer x 30 layers -
+**roughly 31 minutes per generated token** if every eligible `MUL_MAT`
+offloads. Down from an estimated many-hours-to-days at sec 23's numbers,
+but still far from the existing ~17s `-ngl 99 -n 16` smoke test - leaving
+the gate permanently relaxed would turn that same command into several
+hours (every decode step now attempts offload, not just occasional
+large-enough prefill batches per sec 21).
+
+**Decision, via explicit user sign-off given the magnitude of the
+tradeoff**: ship the gate relaxed by default. The backend now genuinely
+supports what this whole multi-section effort (sec 21-25) was building
+toward - real decode-step offload - and that capability being real is
+judged more valuable than keeping the smoke test fast. `docs/run-with-
+ttsim.md` is updated to warn about the new timing reality and recommend
+`-n 1` (or similarly small) for validation runs rather than the previous
+`-n 16`/`-n 64` examples.
+
+**Correctness reverified specifically for the M-padding path**: sec 22
+verified the padding/truncation logic in isolation before the SFPU (sec
+24) and multi-core (sec 25) rewrites existed; none of sec 24/25's own
+tests exercised `M_padded != M` (every one used a tile-aligned M, so
+padding was a no-op in every test run before this section) - genuinely
+new coverage, not just re-confirming old results. Exact sparse diagnostic
+at K=384/N=96 with **M=1**: 0/3456 mismatches. Same with **M=5** (a real,
+non-trivial partial tile - Mt=1, 27 padding rows): 0/17280 mismatches.
+Dense random at M=5: `max_abs_err=0.615`, only 2/480 over a 0.5 threshold
+- consistent with this document's established bf16-noise baseline, not a
+regression.
+
+**Scheduler placement, verified directly**: `GGML_SCHED_DEBUG=2` on a
+partial real run (killed after 90s, well before completion, just to
+observe placement decisions) shows **2730 `MUL_MAT` nodes placed on
+`TT_METALIUM0` versus 673 on CPU** - a complete reversal from sec 21's
+finding (previously ~21% device / 79% CPU, with 0% of *decode-step*
+matmuls ever reaching the device). The remaining CPU-placed nodes are
+expected, not a gap: `kq`/`kqv` attention-score matmuls are never I2_S
+weights and were never eligible for this backend regardless of `M`.
+
+**Real end-to-end milestone: attempted, found a genuine separate blocker,
+not resolved here.** `llama-cli -m <I2_S GGUF> -ngl 99 -dev TT_METALIUM0
+-n 1 --single-turn` hit `GGML_ASSERT(dst_located.offset == 0 &&
+ggml_nbytes(dst) == dst_located.buffer->size() && "ggml-ttnn: mul_mat dst
+must not be a view")` after ~3m37s. This is a pre-existing gap, not caused
+by this section's change: `compute_mul_mat`'s final write has always
+required `dst` (the `MUL_MAT`'s own output tensor) to be the sole occupant
+of its device buffer, a deliberate sec 16 decision at the time ("a future
+view in [src0 or dst] should fail loudly instead of silently
+misbehaving") - it just never fired before because so few `MUL_MAT` nodes
+ever reached this backend. With decode-step offload now real, ggml's
+graph allocator's normal buffer-reuse produces a `dst` that shares a
+buffer with something else often enough to hit this on the very first
+real run.
+
+**First fix attempt, reverted**: routed the final dst write through the
+existing generic `ggml_backend_ttnn_buffer_set_tensor` helper (already
+used elsewhere for exactly this "tensor might not be the sole buffer
+occupant" case - a read-modify-write around the resolved offset, not a
+new mechanism) instead of the raw whole-buffer write that assumes sole
+occupancy. This looked like a small, low-risk change reusing
+already-verified infrastructure - and it *did* get further (past the
+assert, into `free(): invalid next size (normal)` inside `libggml-ttnn.so`
+at ~14s, a heap corruption bug detected downstream of wherever the actual
+overrun happened, the same "detected several frames removed from the real
+bug" signature sec 16's own original heap-corruption find had). Rather
+than chase that blind, or risk shipping a fix that trades a loud,
+deterministic assert for silent corruption, **reverted** the dst-write
+change entirely - confirmed the revert restores the exact original assert
+behavior (same message, same call site, deterministic) and does not
+regress any of this section's own standalone verification (identical
+`max_abs_err`/mismatch numbers before and after, at every M tested).
+
+**Consequence**: the M-gate relaxation itself (this section's actual
+subject) is real, verified, and kept - every isolated-matmul test at
+every shape and M value tested passes, and `GGML_SCHED_DEBUG` confirms
+decode-step `MUL_MAT` genuinely reaches `TT_METALIUM0` now. But the
+*full* real-model end-to-end milestone needs the dst-buffer-aliasing gap
+fixed properly first - a bounded, well-understood problem (unlike sec 16's
+original view-support work, this isn't "design a whole new mechanism,"
+it's "figure out why routing through the already-correct generic
+read-modify-write path corrupts the heap") but one that deserves a clean,
+isolated repro before touching this code again, not a fix attempted
+inside an already-long real-model run. Flagged as the concrete next
+blocker, not resolved here.
+
+
 
 
 
