@@ -204,7 +204,7 @@ host↔device round trip per call (see section 7).
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-24; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-25; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -258,6 +258,22 @@ Full detail in `PORTING_PLAN.md` §9, §13-24; summary:
   ttsim's absolute numbers are known not to represent real hardware
   timing, trading scalar RISC-V work for vector SFPU work plausibly
   matters more on real silicon than these numbers alone suggest.
+- **Multi-core dispatch - another ~10-15x**: `PORTING_PLAN.md` §25 went
+  from §24's single core (`CoreCoord core({0,0})`, every other core on the
+  chip idle) to spreading the N-tile dimension across the device's
+  available cores via the stock `split_work_to_cores` utility - each core
+  computes complete output tiles for its own slice of N independently, no
+  cross-core communication. Verified correct (dense random + an exact
+  sparse diagnostic spanning 12 N-tiles/cores, 0/1769472 mismatches) and
+  measured faster again: the `K=2560,N=2560` call that took ~154s under
+  §24 now completes in ~9.9s (~15.5x), and `K=1280,N=1280` dropped from
+  ~44s to ~4.3s (~10.3x) - both still matching prior sections' error
+  metrics exactly. Cumulative effect since §23: roughly 94x faster.
+  Available parallelism (140 worker cores in this Blackhole config) is not
+  fully realized in wall-clock terms - plausibly per-core dispatch
+  overhead or ttsim's own simulation model, not chased further (§25). The
+  `M%32==0` gate stays in place for now, though the combined §24+§25 win
+  may be worth revisiting that decision over.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB

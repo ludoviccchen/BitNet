@@ -1266,6 +1266,108 @@ parallelism should reward far more than a slow functional simulator can
 show - it remains plausible (not verified) that this redesign matters more
 on real hardware than the ttsim numbers alone suggest.
 
+## 25. Multi-core dispatch: partitioning N-tiles across the device grid,
+    another ~10-15x on top of sec 24's SFPU win
+
+Sec 24's redesign still ran the whole kernel triad on a single Tensix core
+(`CoreCoord core({0, 0})`) regardless of matmul size - every other core on
+the chip sat idle. This section spreads the work across the device's
+available cores instead.
+
+**Design**: N-tile is the natural split axis. `mesh_device-
+>compute_with_storage_grid_size()` gives the available grid;
+`split_work_to_cores(core_grid, Nt)` (a stock tt-metal utility, same one
+`matmul_multi_core` uses) partitions the `Nt` N-tiles into two core groups
+(some cores get one more tile than others when `Nt` doesn't divide evenly)
+and returns the actual core set needed - never more cores than `Nt`, so a
+single-N-tile matmul still runs on exactly one core, unchanged from sec
+24. Each core:
+- Handles a *contiguous* slice `[nt_start, nt_start+nt_count)` of the
+  global N-tile range, computing complete output tiles independently - full
+  `Kt`-depth accumulation, no cross-core communication.
+- Redundantly re-reads the *entire* activation tensor for its own `Mt`
+  loop, same "redundant but simple" tradeoff already used elsewhere in this
+  kernel (sec 13's activation re-reads, sec 20's weight-chunk re-reads).
+- Gets its own independent copy of every CB (`cb_in0`, `cb_in1`, `cb_raw`,
+  `cb_scratch`, `cb_out`) - CBs are per-core L1, so `CreateCircularBuffer`
+  on the whole core set (`all_cores`) just means "allocate this config
+  once per core," not a shared buffer.
+
+Concretely: `Nt` moved from a compile-time arg to a runtime one in the
+compute kernel (`compute/mm.cpp`) - different cores can get different
+`nt_count` values, but one `CreateKernel` call compiles a single binary
+shared by every core in `all_cores`, so anything that varies per core has
+to be a runtime arg, not baked in. The reader and writer kernels each
+gained an `nt_start` runtime arg: the reader needs it to compute the
+*global* N-tile index for the weight's DRAM address (its own loop variable
+`nt` is now local to the core's slice); the writer needs it for the same
+reason when computing the output DRAM page index `(nt_start+n)*Mt+m` - all
+cores share the *same* output buffer (sized for the whole `Mt*Nt` tensor),
+each just writing into its own slice of it.
+
+**Verified correct**: a dense random test at K=128/N=128 (4 N-tiles, so up
+to 4 cores) matched expected bf16-noise tolerance on the first attempt
+(`max_abs_err=0.176439`, 0/4096 over threshold - identical to sec 24's
+single-core number on the same shape). Given sec 24's own history found a
+real concurrency bug specifically once superblock count exceeded 1, this
+change was checked more broadly before trusting it: the full exact sparse
+diagnostic at K=384/N=384 (12 N-tiles - a wide spread across cores, 3
+superblocks, 4 lanes = 144 probes, each exercising whichever core owns
+that probe's N-tile) came back **0/1769472 mismatches**. No new
+concurrency issue this time - each core's reader/compute/writer triad is
+a fully self-contained instance of exactly sec 24's already-verified
+logic, with no CB or `tile_regs` state shared *across* cores (only within
+one core, unchanged from sec 24), so the failure mode that bit sec 24
+(a single kernel's internal CBs sized wrong for its own multi-superblock
+loop) has no multi-core analogue here.
+
+**Timing, measured directly, same standalone harness as sec 22-24**:
+
+| K=N    | sec 24 (SFPU, single-core) | sec 25 (SFPU, multi-core) | speedup |
+|--------|------------------------------|------------------------------|---------|
+| 1280   | ~44s                         | ~4.3s                        | ~10.3x  |
+| 2560   | ~154s                        | ~9.9s                        | ~15.5x  |
+
+Both shapes reproduce sec 23/24's exact error metrics again (identical
+`max_abs_err`/`mean_abs_err`/over-threshold counts) - another pure
+performance change, no numerics difference, as expected: each core runs
+byte-for-byte the same per-tile logic as the single-core version, just
+fewer tiles per core.
+
+**Cumulative picture**: sec 20's original whole-blob design didn't
+complete a K=2560,N=2560 call in over 580s; sec 23's scalar tidy-up got it
+to ~930s; sec 24's SFPU redesign got it to ~154s; this section gets it to
+~9.9s - roughly a 94x improvement from sec 23 to here, in a workload where
+the original design would still be running.
+
+**Not fully explained, flagged rather than chased**: the ttsim SoC
+descriptor for this Blackhole configuration
+(`~/stage_bitnet/Bitnet-TT/sim/soc_descriptor.yaml`) lists 140 functional
+worker cores (a 14x10 grid), comfortably more than `Nt=80` for the K=2560
+case - so in principle up to 80 cores were available for that run.
+`split_work_to_cores` doesn't report which one back to this program at
+that call site, and this wasn't independently reconciled, but the observed
+~15.5x wall-clock speedup is well short of an 80x ceiling, and the
+speedup growing from ~10.3x (`Nt=40`) to ~15.5x (`Nt=80`) rather than
+holding constant suggests the run isn't yet purely core-count-limited.
+Plausible causes, neither confirmed: fixed per-core dispatch/kernel-launch
+overhead that doesn't shrink with core count, or ttsim itself not being a
+throughput-oriented simulator for many-core concurrency (consistent with
+this document's repeated point that ttsim's absolute numbers aren't a
+real-hardware performance proxy - sec 8/18/23/24). Not investigated
+further here since the result is already a substantial, verified win;
+worth revisiting if multi-core scaling itself ever becomes the bottleneck
+under study.
+
+**Consequence**: `ggml_backend_ttnn_mul_mat_shape_ok`'s `M % 32 == 0` gate
+(sec 21/22) is *not* revisited by this section - that's an independent
+question from core count, and the combined effect of sec 24+25 (~94x
+faster than sec 23 alone) changes the practicality calculus enough that
+it may be worth reopening, but that decision is left for a follow-up
+rather than made here.
+
+
+
 
 
 
