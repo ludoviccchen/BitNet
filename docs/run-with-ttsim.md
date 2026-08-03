@@ -227,7 +227,7 @@ numbers were never a performance proxy to begin with.
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-28; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-29; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -339,6 +339,18 @@ Full detail in `PORTING_PLAN.md` §9, §13-28; summary:
   `SIGSEGV` inside tt-metal's `read_shard_from_device`. Each reproduction
   costs ~90+ minutes, so not chased further yet - see the known issue in
   §6 and the full story in §27.
+- **Two cheap repro attempts, both negative**: `PORTING_PLAN.md` §29
+  built fast, targeted stress tests using `ggml_gallocr_alloc_graph` (the
+  actual llama.cpp scratch-reuse mechanism - every earlier standalone
+  test in this project used `ggml_backend_alloc_ctx_tensors` instead,
+  which never reuses addresses and structurally cannot exercise this
+  class of bug). Neither this backend's own `MUL_MAT` buffer-churn (3000
+  iterations, >10x real decode volume) nor sustained `SET_ROWS`/KV-cache
+  traffic (50000 iterations, >1000x real decode volume) reproduces the
+  crash. The real bug most plausibly needs the actual `ggml_backend_sched`
+  machinery (mixed CPU/TTNN graph splitting) that no test in this project
+  has ever exercised, or is a rare condition only reachable at real,
+  sustained execution scale - not chased further this round; see §29.
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB

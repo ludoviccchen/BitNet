@@ -1641,6 +1641,74 @@ it. Worth re-measuring once real hardware is available (per the
 standing recommendation throughout this document), where this specific
 gap is expected to look very different.
 
+## 29. Chasing sec 27's new SIGSEGV: two hypotheses cheaply tested and
+    ruled out, real repro needs more than direct backend dispatch
+
+Picked up sec 27's flagged next step: root-cause the `SIGSEGV` inside
+tt-metal's `read_shard_from_device` that a real end-to-end run hit after
+93 minutes, without paying ~90 minutes per attempt again.
+
+**Key enabling realization**: every standalone test in this entire
+porting effort (sec 13 onward) uses `ggml_backend_alloc_ctx_tensors` -
+which gives every tensor its own dedicated, never-reused slot. It cannot
+exercise the address-reuse behavior that produced sec 27's stale-buffer
+bug (or plausibly this one) at all. `ggml_gallocr_new` +
+`ggml_gallocr_alloc_graph` is the actual mechanism `ggml_gallocr`/
+llama.cpp uses (reusing a persistent scratch arena across many graph
+builds) - switching standalone tests to this API is what makes a cheap,
+fast repro of this *class* of bug possible in principle.
+
+**Hypothesis 1: `MUL_MAT` buffer/address churn under multi-core
+dispatch.** Two persistent I2_S weights of different N (mimicking
+`Qcur`/`Vcur`'s mismatched-size address reuse from sec 27) in one graph,
+rebuilt via `ggml_gallocr_alloc_graph` for 3000 iterations (each
+iteration includes both a 10-core and a 2-core dispatch, exercising
+sec 27's stale-registry-repair path repeatedly) - **3000/3000 clean, no
+crash**, in 35 minutes (real decode-step volume is ~210-280 `MUL_MAT`
+calls total, so this is >10x that in one op type alone).
+
+**Hypothesis 2: sustained `SET_ROWS`/KV-cache traffic.** A persistent
+"cache" tensor, repeatedly written (`ggml_set_rows`) and read back
+(`ggml_view_2d`) via the same buffer object every iteration (no address
+churn this time - tests sustained NOC/queue traffic on one buffer
+instead) - **50000/50000 clean, no crash**, in 6.3 seconds. A real
+single-token decode needs on the order of 30 `SET_ROWS` calls (one per
+layer); this is >1000x that.
+
+**Both ruled out.** Re-examined the original crash log's exact line
+ordering to make sure the failure mode itself was understood correctly
+before concluding anything: `Signal: Segmentation fault` appears
+*before* the `Closing user mode device drivers`/`Sending exit signal to
+remote` lines, confirming those are the crash handler's own teardown
+attempt after already catching the SIGSEGV, not evidence of a graceful
+shutdown-time bug - this is a genuine mid-execution fault, consistent
+with sec 27's original read.
+
+**Consequence**: neither of the two most obvious hypotheses (this
+backend's own buffer-lifecycle churn, or sustained single-buffer
+traffic) reproduces the bug even at volumes far exceeding a single real
+decode step - in isolation, via direct backend dispatch
+(`ggml_backend_graph_compute(backend, gf)`, bypassing `ggml_backend_sched`
+entirely, same as every prior test in this document). The real bug most
+plausibly needs one of: (a) the actual `ggml_backend_sched` machinery a
+real run goes through - mixed CPU/TTNN graph splitting, cross-backend
+copy insertion, none of which any test in this document has ever
+exercised; (b) a rare condition (e.g. a threading race in tt-metal's
+async command-queue worker, given tt-metal dispatches work
+asynchronously under the hood) that only manifests after sustained real
+execution at a scale these cheap synthetic loops don't reach even at
+3000-50000 iterations; or (c) something specific to the real model's
+graph shape/depth (30 layers, many distinct tensor shapes coexisting)
+that these 1-2-shape synthetic loops don't capture. Building a
+`ggml_backend_sched`-based repro (registering both CPU and TTNN
+backends, letting the scheduler split a mixed graph) is a real next
+step and plausibly still cheap relative to a full `llama-cli` run, but a
+bigger undertaking than either hypothesis tested here - flagged rather
+than started, since the two most promising and independently-informative
+cheap tests are conclusively negative results worth reporting on their
+own.
+
+
 
 
 
