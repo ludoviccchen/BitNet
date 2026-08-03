@@ -227,7 +227,7 @@ numbers were never a performance proxy to begin with.
 
 ## 7. Known limitations to keep in mind
 
-Full detail in `PORTING_PLAN.md` §9, §13-29; summary:
+Full detail in `PORTING_PLAN.md` §9, §13-30; summary:
 
 - **Performance is not representative**: every offloaded `mul_mat` and
   `SET_ROWS` does a full host↔device round trip per call (the buffer type
@@ -351,6 +351,21 @@ Full detail in `PORTING_PLAN.md` §9, §13-29; summary:
   machinery (mixed CPU/TTNN graph splitting) that no test in this project
   has ever exercised, or is a rare condition only reachable at real,
   sustained execution scale - not chased further this round; see §29.
+- **A third hypothesis, also negative**: `PORTING_PLAN.md` §30 built the
+  bigger repro §29 flagged - a real `ggml_backend_sched` with both CPU
+  and TTNN backends registered, computing a graph that genuinely bounces
+  between them every iteration (confirmed via `n_splits` staying at 3
+  throughout) plus the same KV-cache pattern. **2000 iterations, 28
+  minutes, still no crash.** Three independently-reasonable hypotheses
+  (this backend's buffer churn, sustained KV-cache traffic, and now real
+  scheduler-driven cross-backend splitting) are all ruled out. Remaining
+  candidates not yet tested: multi-threading (the real run used `-t 2`),
+  absolute wall-clock duration (93 min vs. these tests' 28-35 min, in
+  case this is time-gated rather than iteration-gated), and
+  shape/address diversity (a real 30-layer graph cycles through 7
+  distinct per-layer shapes, these tests reuse 2-3). Not pursued further
+  this round - see §30 for the full reasoning and the two realistic next
+  steps (instrumented real run, or a more elaborate synthetic repro).
 - **L1 capacity**: fixed (`PORTING_PLAN.md` §20) - the ternary matmul kernel
   (Option B) now streams one N-tile's packed weight row-block at a time
   instead of keeping the whole blob resident, bounding L1 usage to 20-54KB

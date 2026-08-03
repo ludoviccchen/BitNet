@@ -1708,6 +1708,70 @@ than started, since the two most promising and independently-informative
 cheap tests are conclusively negative results worth reporting on their
 own.
 
+## 30. A third hypothesis, the real `ggml_backend_sched` machinery -
+    also negative
+
+Built the bigger repro sec 29 flagged rather than started: a real
+`ggml_backend_sched_t` with both the CPU and TTNN backends registered
+(`ggml_backend_sched_new({ttnn, cpu}, ...)`), computing a graph that
+deliberately bounces between them every iteration - `mul_mat` (TTNN) ->
+`rms_norm` (CPU-only, forces a TTNN->CPU copy) -> `mul_mat` (TTNN,
+forces the copy back) - plus the same `SET_ROWS`/`VIEW` KV-cache pattern
+from sec 29, run through `ggml_backend_sched_alloc_graph` +
+`ggml_backend_sched_graph_compute` (not direct backend dispatch) so the
+scheduler's real graph-splitting and cross-backend-copy insertion runs
+every iteration, confirmed via `ggml_backend_sched_get_n_splits` staying
+at 3 throughout.
+
+**Result: 2000/2000 iterations clean, 28 minutes, no crash.** This is
+the first test in this entire project to exercise real scheduler-driven
+CPU/TTNN graph splitting at all, and it still doesn't reproduce sec 27's
+`SIGSEGV`.
+
+**Three hypotheses now cleanly ruled out** (sec 29 + this section):
+this backend's own `MUL_MAT` buffer-lifecycle churn, sustained
+`SET_ROWS`/KV-cache traffic on one buffer, and real cross-backend graph
+splitting with actual copies - none reproduce the crash even at volumes
+and durations that individually exceed a real decode step by 10-1000x.
+
+**Remaining candidate differences between these synthetic repros and the
+real failing run**, not yet tested: (a) **multi-threading** - the real
+run used `-t 2`; these tests never explicitly configured CPU thread
+count, so if the bug is a race specifically between llama.cpp's own
+worker threads and tt-metal's async command-queue dispatch, none of
+these tests would trigger it regardless of iteration count; (b)
+**absolute wall-clock duration** - the longest of these tests ran ~28-35
+minutes against the real failure's 93 minutes; if this is a rare event
+gated by elapsed time rather than iteration count (e.g. a slow
+resource leak or counter effect somewhere in ttsim or tt-metal, not
+this backend's own code, which has no such state), none of these would
+have run long enough regardless of how many iterations they packed in;
+(c) **shape/address diversity** - every iteration here reuses the same
+2-3 tensor shapes, while a real 30-layer graph cycles through 7 distinct
+per-layer shapes across `attn_q/k/v/output` and `ffn_gate/up/down` every
+single decode step, giving substantially more distinct address-reuse
+combinations than these tests exercise even at high iteration counts;
+(d) untested op types the real graph also contains (`FLASH_ATTN`,
+`ROPE`, `SOFT_MAX`, `GET_ROWS`, ...) that stay on CPU either way but
+could still influence scheduler behavior or timing in ways these
+simplified graphs don't.
+
+**Not pursued further this round.** Each of (a)-(d) suggests a
+plausible next synthetic test, but confidence that any single one would
+reproduce the bug is low after three independently-reasonable hypotheses
+came back negative - the pattern suggests this needs either the real
+model's actual scale and duration, or a specific combination of factors
+these targeted tests haven't stumbled onto together. The two realistic
+paths from here are: re-run the real end-to-end model with proactive
+debug instrumentation already in place (to catch the fault with useful
+state at the moment it happens, rather than a bare backtrace after the
+fact - the sec 27 approach that worked well for the *previous* bug, just
+applied to a run expensive enough that it should be planned rather than
+retried blind), or keep building progressively more faithful synthetic
+repros informed by (a)-(d). Flagging status rather than picking one
+unilaterally, given the cost profile of both options.
+
+
 
 
 
