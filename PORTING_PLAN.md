@@ -2436,6 +2436,81 @@ has served its purpose - it was always meant to be temporary, and its
 presence stops being informative once the question it was added to
 answer has a confident answer.
 
+## 37. Closing sec 31-33's last remaining gap: llama-quantize verified
+    against a real HF checkpoint, not just a synthetic model
+
+Sec 33 explicitly declined to test against a real HF checkpoint ("would
+require downloading/converting a full model - not done in this pass").
+Closed that without a network download: found a real HF checkpoint
+(`1bitLLM/bitnet_b1_58-large` - 24 layers, 1536 hidden, real safetensors +
+tokenizer) already present at `models/bitnet_b1_58-large/`, predating this
+session.
+
+**First attempt hit a pre-existing, unrelated problem**: an
+`ggml-model-f32.gguf` already sitting in that directory failed to
+quantize (`tensor 'blk.8.ffn_up.weight' data is not within the file
+bounds, model is corrupted or incomplete`) - a truncated file from
+whatever earlier, unrelated process created it, nothing to do with this
+session's changes. Deleted it and regenerated a fresh one via
+`utils/convert-hf-to-gguf-bitnet.py models/bitnet_b1_58-large --outtype
+f32` (53s, 2.9GB, 266 tensors) - the actual documented conversion step,
+run for real.
+
+**Ran the exact `setup_env.py` command against it**:
+`llama-quantize --token-embedding-type f16 ggml-model-f32.gguf
+ggml-model-i2_s.gguf I2_S 1`. Real output: all 266 tensors processed, every
+attn/ffn weight (`attn_q/k/v/output`, `ffn_gate/up/down`, across all 24
+layers) converted to `i2_s` with no fallbacks this time (unlike sec 33's
+tiny model, this one's dimensions - 1536, 4096 - are large enough that
+the `output.weight` `Q6_K`-divisibility fallback (sec 8) never triggers).
+2780 MiB -> 256.56 MiB (2.95 BPW), 15 seconds, exit 0. This model also has
+real BitNet-specific `attn_sub_norm`/`ffn_sub_norm` tensors (absent from
+sec 33's simplified synthetic architecture) - correctly left untouched as
+F32, confirming the quantize-type-selection logic generalizes beyond the
+minimal tensor set sec 33 exercised.
+
+**Verified with real generation, real tokenizer, CPU-only**: loaded
+cleanly in `llama-cli` (`ftype: I2_S`), produced real generated text at
+125.7 t/s prompt / 32.4 t/s generation - sane numbers for CPU inference of
+a small real model, and (unlike sec 33's synthetic model) a real,
+complete SPM tokenizer this time, so no synthetic-vocab workarounds were
+needed. The output itself is echo-y/repetitive, expected for a small,
+non-instruction-tuned base 1.58-bit model, not a defect.
+
+**Full TTNN offload confirmed too** (`-ngl 99 -dev TT_METALIUM0`, `-n 1`):
+this model's 1536/4096 dimensions satisfy the `K%128==0`/`N%32==0` shape
+gate, so both `MUL_MAT` and `SET_ROWS`/KV-cache genuinely offload. A first
+`-n 4` attempt didn't finish inside a 10-minute wait (not a crash - ttsim
+per-matmul cost at real dimensions, sec 8/18's standing
+not-a-performance-proxy caveat, times 7 projections/layer x 24 layers);
+the documented `-n 1` command completed cleanly in 4657.7s (~78 minutes) -
+exit 0, no `GGML_ASSERT`/crash signatures, clean device teardown, JIT
+cache populated (17/23 hits - lower than the fully-warmed 2B-model runs
+in sec 36 since this model's tile shapes hadn't been dispatched before).
+A real second independent model, at a different real scale (1536/4096 vs.
+2560/6912), now confirms sec 36's SIGSEGV-resolution finding rather than
+resting on the one model alone.
+
+**Consequence**: every fix from sec 31-37 is now verified against three
+independent tiers - isolated unit tests, a synthetic multi-layer model,
+and a real, if small, HF-derived model with its real tokenizer and real
+BitNet-specific architecture quirks. The only remaining "not done, by
+choice" tier is the actual target model
+(`microsoft/BitNet-b1.58-2B-4T`) run through this exact `llama-quantize`
+path end to end - today it's only ever tested pre-quantized (sec 12
+onward); this session's fixes are verified correct via the smaller real
+model and via the pre-quantized 2B model's SIGSEGV confirmation runs
+(sec 36) separately, but never both together in one path.
+
+**Process note, unrelated to the port itself**: a background test launch
+in this session silently failed to run at all (a redirect to a
+scratchpad path left over from earlier in this conversation, which no
+longer existed after an environment/session boundary) while still
+reporting a misleading "completed, exit 0" - caught by checking the
+actual output content rather than trusting the status alone, and
+re-run correctly. Worth remembering: a background task's reported exit
+code reflects the wrapping shell, not proof the intended command ran.
+
 
 
 
