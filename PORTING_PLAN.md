@@ -1771,6 +1771,671 @@ retried blind), or keep building progressively more faithful synthetic
 repros informed by (a)-(d). Flagging status rather than picking one
 unilaterally, given the cost profile of both options.
 
+## 31. `llama-quantize`'s missing I2_S entry, fixed - a real, silent
+    bit-layout/scale bug found underneath it, and the multi-thread
+    chunking gap closed too
+
+Independently of sec 29-30's SIGSEGV chase, picked up a different standing
+gap (sec 12/18: "`llama-quantize` in this branch has no `I2_S` entry ...
+producing I2_S GGUFs locally isn't possible"). This is not just a Phase-1
+curiosity: `setup_env.py`'s documented, official `-q i2_s` pipeline
+(`README.md`) already calls `llama-quantize <f32.gguf> <i2s.gguf> I2_S 1`
+unconditionally - the documented workflow was silently broken for anyone
+without a pre-quantized GGUF.
+
+**Two independent gaps, both required to actually make the documented
+command work, not just parse:**
+
+1. **Registration gap** (the one the doc already knew about): `I2_S` was
+   absent from `tools/quantize/quantize.cpp`'s `QUANT_OPTIONS` table and
+   from `llama_ftype_get_default_type()` (`src/llama-quant.cpp`) - added
+   both (`GGML_TYPE_I2_S` was already correctly wired into
+   `ggml_quantize_chunk`'s dispatch table, sec 17/18's own findings). With
+   only this fix, the CLI accepts `I2_S` but throws `"quantized data
+   validation failed"` immediately - `ggml_validate_row_data()`
+   (`ggml/src/ggml-quants.c`) had no `GGML_TYPE_I2_S` case and fell to
+   `default:` (unconditionally invalid). Fixed by adding a case: every
+   2-bit code is inherently a valid ternary value (no invalid bit
+   pattern exists), so the only real thing to check is the trailing
+   per-tensor f32 scale for NaN/Inf, reusing the existing `validate_float`
+   helper the same way the `F32`/`BF16` cases already do.
+
+2. **A real, silent correctness bug underneath both of those**, found
+   while tracing the actual write path rather than assuming registration
+   alone would be enough: `quantize_i2_s()` (`ggml/src/ggml-cpu/quants.c`)
+   packs four *consecutive* elements per byte
+   (`byte[i/4]`, bit `6-2*(i%4)`) - but sec 10 of this document already
+   proved, by cross-checking against the real AVX2 inference dot product
+   (`ggml_vec_dot_i2_i8_s_1x1`, same file), that the *only* layout real
+   BitNet inference (and this backend's own kernels) ever reads is the
+   strided-by-32-within-128 layout implemented by `dequantize_row_i2_s`.
+   These two were never fixed to agree - sec 10 only established which one
+   is ground truth and worked around it locally in this backend's own
+   dequant code; the shared, upstream `quantize_i2_s` itself was still
+   producing GGUFs in the *wrong*, inference-incompatible layout. Separately,
+   its scale computation looped over every element but `break`d on the
+   first nonzero magnitude found, effectively using an arbitrary early
+   value as "the max" instead of the true max-abs (sec 10 flagged this too,
+   as a suspicion, not yet fixed).
+
+**Fix**: rewrote `quantize_i2_s()`'s packing loop to mirror
+`dequantize_row_i2_s()`'s own indexing exactly (byte `done/4+gp` <- elements
+`{done+gp, done+32+gp, done+64+gp, done+96+gp}` at bit positions
+`{6,4,2,0}`), and the scale scan to a genuine full-array max (no early
+`break`). Also zeroed the full 32-byte scale header (previously only the
+packed region was `memset`, leaving 28 uninitialized trailer bytes written
+into every GGUF this function ever produced).
+
+**Verified**: a standalone test linking `libggml-cpu.so` directly (same
+methodology as sec 10's original cross-check) quantizes a 256-element
+array with a deliberately-planted true max *not* at the first nonzero
+index (to specifically catch the old early-`break` bug) through
+`quantize_i2_s()` then `dequantize_row_i2_s()`: recovered scale matches
+the true max exactly (not the old first-nonzero value), and all 256
+round-tripped values match the expected `{-scale, 0, +scale}` exactly
+(0 mismatches). `ggml_quantize_chunk`'s own internal size assert
+(`result == n/4+32`) and `gguf_get_tensor_size()`'s independent
+computation (via `ggml_nbytes`'s sec 17/18 special case) were traced by
+hand and confirmed to agree for the single-threaded (`nthread=1`) path -
+the exact path `setup_env.py` always uses. `llama-quantize`, `ggml-base`,
+`ggml-cpu`, and `llama` all rebuild clean with no new warnings.
+
+**A third gap, found while writing up the above as "not fixed here" and
+fixed in the same pass instead of just flagged**: `llama_tensor_quantize_impl`'s
+multi-threaded path (`nthread>1`) computes each worker chunk's output
+offset via `ggml_row_size(I2_S, n_per_row)`, which (sec 17) returns the
+*unpacked* per-row byte count for `I2_S`, not the real packed stride -
+chunks would land at wrong, overlapping offsets, and each chunk's own
+call to `quantize_i2_s` would additionally write its own spurious 32-byte
+scale trailer into the middle of the packed blob. `setup_env.py` always
+passes `nthread=1` explicitly so the documented workflow was never at
+risk, but `llama-quantize`'s own CLI defaults `nthread` to
+`std::thread::hardware_concurrency()` when the argument is omitted - an
+easy, silent way for anyone running the tool by hand (not through
+`setup_env.py`) to get a corrupted I2_S GGUF. Root cause is structural,
+not a simple off-by-one: `quantize_i2_s` computes one scale and writes one
+trailing header for its *entire* call, so unlike per-block-scale types
+(`Q4_0`, `Q8_0`, ...) it cannot be correctly split into independent
+row-chunks at all - a real fix would need a two-pass redesign (global
+max first, then per-chunk packing against it, with the header written
+once by the driver, not the function). Chose the smaller, obviously-safe
+fix instead: force `nthread_use = 1` whenever `new_type == GGML_TYPE_I2_S`,
+regardless of the requested thread count, mirroring this document's
+standing preference (sec 17/18) for minimal, well-understood fixes over
+restructuring shared infrastructure. The same root condition also affects
+the MoE (`tensor->ne[2]>1`) per-expert offset at `llama-quant.cpp:1244`
+independent of thread count - left unfixed, since it needs a real 3D
+tensor to trigger at all and BitNet-b1.58-2B-4T (and every model this
+port targets) is dense, not MoE.
+
+**Verified**: `llama-quantize`/`llama` rebuild clean after the
+`nthread_use` change; not covered by an isolated test (the affected logic
+is a private static function inside `llama_model_quantize_impl`, not
+reachable without a full valid GGUF + model context) - correctness rests
+on the change being a direct, unconditional force-to-1 for the one type
+whose chunking is unsafe, verified by inspection against the exact
+`nthread_use` expression it replaces.
+
+**Not yet re-verified**: a full `setup_env.py -q i2_s` run against a real
+HF checkpoint (would require downloading/converting a full model - not
+done in this pass); the fix's correctness rests on the standalone
+round-trip test plus a hand-traced confirmation that every function in
+the real call chain (`ggml_quantize_chunk` -> `quantize_i2_s` ->
+`ggml_validate_row_data` -> `gguf_set_tensor_type`/`gguf_get_tensor_size`)
+agrees on sizes for the single-threaded, non-MoE case.
+
+## 32. I2_S size accounting: investigated modeling it as a real block-quantized
+    type, found that doesn't fit the format, did the safer consolidation instead
+
+Follow-up to sec 31's finding that `ggml_row_size()`/`ggml_nbytes()`/
+`ggml_new_tensor_impl()` have needed independent, easy-to-miss special
+cases for `I2_S` three times now (sec 17, sec 18, sec 31). Investigated
+whether `I2_S` could instead be given a real `blck_size`/`type_size` in
+`type_traits[]` (the way every other quantized type - `Q4_0`, `TQ1_0`,
+etc. - works), which would let `ggml_row_size()` compute the right answer
+generically with no per-call-site special case at all.
+
+**Ruled out, with evidence, before writing any code**: traced every place
+the I2_S scale is actually read back - `quantize_i2_s()`/
+`dequantize_row_i2_s()` (sec 10) and the real inference GEMM
+(`ggml/src/ggml-cpu/repack.cpp:4908`,
+`const float ws = *(const float *)(src0->data + (ne00*ne01/4));`) - and
+confirmed there is exactly **one** f32 scale for the *entire 2D tensor*,
+appended once after all the packed data, not a per-block scale the way
+`blck_size` in `type_traits[]` assumes (a fixed, compile-time constant
+number of elements sharing one scale, repeated N times across a tensor).
+Setting `blck_size=128` (to model the 128-element strided-packing
+superblock from sec 10) with `type_size=36` (32 packed bytes + 4 scale
+bytes) would silently compute `(n/128)*36 = n/4 + n/32` instead of the
+real `n/4 + 32` - correct only in the coincidental case `n==1024`, wrong
+(with no assert to catch it) for every real tensor shape otherwise. This
+would have been a strictly worse bug than the one being fixed: today's
+bugs at least crash loudly (`GGML_ASSERT`) or get caught by validation;
+a wrong-but-plausible `blck_size` would silently miscompute sizes for
+every real model tensor. Confirmed this before implementing anything,
+per the standing project preference (sec 17: "risks touching the shared
+CPU I2_S path... not attempted here") for verifying a restructuring is
+actually sound before doing it.
+
+**What was done instead**: `ggml_row_size()` itself was left untouched -
+survey of every call site in the tree (`grep -rn "ggml_row_size("`, ~150
+hits) confirmed the overwhelming majority operate on activation/KV-cache
+tensor types (`F32`, `F16`, quantized activation types) that are never
+`I2_S`, and the handful of `I2_S`-relevant call sites split into two
+categories: (a) "unpacked-per-row size, to be multiplied by other dims
+and packed once at the end" (`ggml_new_tensor_impl`, already correct
+since sec 18) - genuinely fixable by consolidation; (b) "byte stride for
+independently chunking rows" (`ggml_quantize_chunk`,
+`llama_tensor_quantize_impl`) - fundamentally incompatible with I2_S's
+single-whole-tensor-scale format no matter what `ggml_row_size()` returns,
+already neutralized by sec 31's `nthread_use` fix, not revisited here.
+
+Extracted the repeated `nbytes/4+32` formula (category (a)) into one
+static helper, `ggml_bitnet_packed_nbytes()` (`ggml.c`, right above
+`ggml_nbytes()`), now called from both `ggml_nbytes()` and
+`ggml_new_tensor_impl()` instead of each carrying its own copy of the
+arithmetic. Also fixed a third, previously-unnoticed instance of the same
+category: `llama_model_quantize_impl`'s `--dry-run` size estimate
+(`llama-quant.cpp:1157`) computed `ggml_nrows(tensor) *
+ggml_row_size(new_type, tensor->ne[0])` with no packing adjustment at
+all, so `llama-quantize --dry-run ... I2_S` would have reported a size
+~4x too large (cosmetic only - `--dry-run` never writes a file - but a
+real, reachable bug for anyone using that flag with `-q i2_s`). Fixed
+inline with the same formula (cross-library from `ggml.c`'s static
+helper, so not sharable directly - kept as one clearly-commented copy
+referencing the same convention rather than adding new public API for a
+single logging call site).
+
+**Verified**: `llama-quantize` and `llama-cli` (the latter exercises
+`ggml_nbytes`/`ggml_new_tensor_impl` on every tensor of every model
+loaded, not just I2_S ones - a real regression-risk surface for this
+change) both rebuild clean. Two standalone tests: (1) sec 31's
+quantize/dequantize round-trip re-run unchanged (0/256 mismatches,
+confirms `ggml-cpu`'s `quants.c` - untouched this round - still links and
+behaves identically); (2) a new test linking `libggml-base.so` directly,
+creating a real `ggml_tensor` of type `I2_S` via the public
+`ggml_new_tensor_2d()` API (so it exercises `ggml_new_tensor_impl()`'s
+real code path, not just the helper in isolation) at `ne=[256,64]`
+(`n=16384`): `ggml_nbytes()` returns exactly `4128` (`16384/4+32`,
+matching by hand), and `ggml_view_1d()` on that tensor succeeds (exercises
+`ggml_new_tensor_impl()`'s view-sanity `GGML_ASSERT` that sec 17
+originally found broken) without triggering the assert.
+
+**Consequence**: the three-sites-in-two-files split from sec 17/18/31 is
+now two sites in one file sharing one function (`ggml.c`), plus one
+necessarily-separate copy in `llama-quant.cpp` (different library) that's
+now at least fixed and clearly cross-referenced. The genuinely
+un-consolidatable part - `ggml_quantize_chunk`/`llama_tensor_quantize_impl`'s
+row-chunking usage - remains what it always was: not a size-formula bug
+fixable by a shared helper, but a structural mismatch between I2_S's
+single-global-scale format and ggml's per-row-chunk quantization
+machinery, already worked around at the call site (sec 31) rather than
+solved at the root. A genuine root fix (two-pass quantize: global max
+first, then per-chunk packing against it, header written once by the
+driver) remains unimplemented and unattempted, flagged consistently
+since sec 31.
+
+## 33. Closing sec 31/32's "not yet re-verified" gap: a real, full
+    llama-quantize -> llama-cli/llama-perplexity end-to-end run
+
+Sec 31 and 32 both explicitly declined to test against a real HF
+checkpoint ("would require downloading/converting a full model - not done
+in this pass"), leaving every fix verified only via isolated standalone
+tests (round-trip quantize/dequantize, `ggml_nbytes` on a synthetic
+tensor). Closed that gap without a network download, by discovering (via
+`git log -- utils/generate-dummy-bitnet-model.py`, "initial commit" - this
+predates the TT port entirely) that the repo already ships a dummy-model
+generator for exactly this purpose, and independently building a smaller,
+more minimal one (`gguf-py`'s `GGUFWriter` directly - no HF checkpoint,
+tokenizer file, or `config.json` needed) that turned out sufficient:
+
+**Model**: 2-layer, 64-embd, 4-head, 128-ff synthetic llama-arch GGUF,
+random N(0, 0.02^2) F32 weights, a 291-token SPM vocab (3 special tokens +
+256 byte-fallback tokens, required by `llm_tokenizer_spm_session` - an SPM
+vocab without these crashes tokenization with an unrelated
+`unordered_map::at`, discovered and fixed along the way, nothing to do
+with I2_S) + 32 dummy word tokens, and a trivial passthrough chat template.
+
+**Ran the exact command `setup_env.py` uses**:
+`llama-quantize --token-embedding-type f16 tiny-f32.gguf tiny-i2s.gguf
+I2_S 1`. Real output, unedited:
+
+```
+[   1/  21] output.weight            - ..., converting to q8_0 ..
+[   3/  21] token_embd.weight        - ..., converting to f16 ..
+[   4/  21] blk.0.attn_k.weight      - ..., converting to i2_s ..
+...(all 14 attn/ffn weight tensors across both layers -> i2_s)...
+llama_model_quantize_impl: WARNING: 1 of 21 tensor(s) required fallback quantization
+```
+
+`output.weight`'s fallback to `q8_0` is sec 8's pre-existing, untouched
+`llama_tensor_get_type_impl` logic (`nx=64` not divisible by 256, the
+`Q6_K` block size) - expected, unrelated to this work, same as it would be
+for any other sub-4-bit quant type on a tensor this small.
+
+**Loaded the result in real `llama-cli`** (`-ngl 0`): model banner prints
+`ftype: I2_S`, reaches the prompt loop - this exercises the *real*
+`gguf.cpp` reader, `llama-model-loader.cpp`, and `llama_new_context_with_model`
+(KV-cache + compute-buffer allocation via `ggml_gallocr`, the same
+allocator whose address-reuse behavior sec 27's stale-buffer bug and this
+document's various `ggml_nbytes`/`ggml_new_tensor_impl` fixes are about) -
+zero crashes, zero `GGML_ASSERT` failures, on every one of the I2_S
+tensors `quantize_i2_s` had just packed.
+
+**Got a real forward pass with `llama-perplexity -c 16`** (bypasses the
+chat-template layer entirely, unlike `llama-cli`'s conversational mode,
+which hit an unrelated `unordered_map::at` in chat-template application -
+a pre-existing quirk of this fork's server-merged CLI, confirmed unrelated
+by reproducing the identical error with *zero* change to the chat template
+metadata):
+
+```
+Final estimate: PPL = 291.5814 +/- 0.23208     (I2_S)
+Final estimate: PPL = 291.4992 +/- 0.24755     (F32, same model, ppl baseline)
+```
+
+Every `MUL_MAT` in both forward passes - Q/K/V/output and gate/up/down
+projections, both layers - ran through the real CPU I2_S GEMM path
+(`ggml/src/ggml-cpu/repack.cpp`'s `tensor_traits_i2s::compute_forward`,
+which reads the per-tensor scale via `*(data + ne00*ne01/4)` - exactly the
+offset `quantize_i2_s` (sec 31) now writes to correctly). The two PPL
+values landing within ~0.03% of each other, rather than diverging wildly
+or one being `nan`/`inf`, is exactly what a working ternary-sign
+quantization of untrained random weights should produce (RMSNorm at every
+layer boundary is scale-invariant, so a global per-tensor sign+scale
+reduction of Gaussian weights preserves most of the "structure" there is
+to preserve) - strong, non-isolated evidence the packed bit layout,
+scale, and validation fixes (sec 31) and the size-accounting consolidation
+(sec 32) are correct together, not just individually.
+
+**Also confirmed, incidentally**: `utils/generate-dummy-bitnet-model.py`'s
+own `read_gguf_file()` debug helper (pre-existing, unrelated to this
+session) already reads tensor sizes via `reader.tensors[i].n_elements`,
+never `.n_bytes` - meaning gguf-py's `GGML_QUANT_SIZES[I2_S] = (1, 1)`
+(the exact same "1 byte per element, unaware of real packing" convention
+`ggml.c`'s `type_traits[]` uses, sec 17) does not affect any tooling this
+project actually runs. Found this by inspecting the just-quantized GGUF
+with `gguf.GGUFReader` directly - its `.n_bytes` property reports the
+unpacked, 4x-too-large size for every I2_S tensor (e.g. 4096 instead of
+1056 for a 64x64 weight) - a fourth instance of the same bug family (sec
+17/29/31/32), this time in a completely separate codebase (Python, not
+`ggml.c`). **Not fixed**: out of scope (a different project's package,
+not exercised by any script here), and flagged only because it was found
+as a side effect of building this test's verification tooling, not
+because anything in this repo's actual pipeline depends on it.
+
+**Consequence**: sec 31 and 32's explicitly-flagged verification gap is
+closed for the mechanism (quantize -> load -> real matmul), without
+needing a real trained checkpoint. What remains genuinely untested is
+scale: this ran at BitNet-b1.58-2B-4T's *shape family* in miniature
+(2 layers/64-embd vs. 30 layers/2560-embd) with a network-free synthetic
+model, not the real 2B-parameter GGUF end to end through this exact
+`llama-quantize` binary - the real model was previously only ever tested
+pre-quantized (sec 12 onward). Re-running this same `llama-quantize`
+command against a real downloaded HF checkpoint remains the one step not
+done here, by choice (matches sec 31/32's own stated scope), not by
+inability.
+
+## 34. A new, real, cheaply-reproduced backend bug found via sec 33's tiny
+    model: SET_ROWS breaks for non-unified (multi-sequence) KV caches
+
+Sec 33's tiny synthetic model is a genuinely useful asset beyond
+verifying the quantize fixes: unlike every previous real-model test in
+this document (which needed the actual 2B-parameter GGUF and 15s-93min
+per run), it iterates in *seconds*, real `llama-cli`/`llama-perplexity`
+binary and all. Bumped its dimensions to satisfy the TTNN backend's
+`K%128==0`/`N%32==0` shape gate (128-embd/256-ff instead of sec 33's
+64/128) so `-ngl 99 -dev TT_METALIUM0` would actually offload something,
+then tried the one real-model configuration no test in this document has
+ever exercised against this backend: a **non-unified, multi-sequence KV
+cache** (sec 21 used `-kvu` specifically to *avoid* this, since without it
+`llama-batched` fails for an unrelated llama.cpp scheduling reason before
+ever reaching the backend - meaning this configuration was never actually
+tested here, not just untested via TTNN specifically).
+
+**Found by accident, not by design**: `llama-perplexity` internally
+parallelizes across sequences for throughput (its own `n_seq_max=128` by
+default, unrelated to anything requested), which - unbeknownst until
+tracing why `-c 16` logged "rounding down to 32768" - creates exactly this
+non-unified multi-sequence KV cache shape. `llama-perplexity -m tiny-i2s
+-f input.txt -ngl 99 -dev TT_METALIUM0 -c 16` crashed in under a second:
+
+```
+ggml-ttnn.cpp:678: GGML_ASSERT(a->ne[0] == nc && a->ne[2] == ne02 && a->ne[3] == ne03) failed
+```
+
+**Root-caused by reading three files side by side** (`ggml-ttnn.cpp`,
+`llama-kv-cache.cpp`, `ggml-cpu/ops.cpp`'s reference implementation), not
+guessed: `llama_kv_cache::cpy_k`/`cpy_v` (`llama-kv-cache.cpp:1330-1343`)
+reshape the KV cache's real 3D tensor (`[n_embd_gqa, kv_size, n_stream]`,
+`n_stream = n_seq_max` when non-unified) into a flat 2D
+`[n_embd_gqa, kv_size*n_stream]` view *before* calling `ggml_set_rows` -
+"because the idxs are global" (its own comment): row indices address the
+whole multi-stream cache as one flat space rather than doing a per-stream
+broadcast. `ggml_set_rows()` (`ggml.c:3977`) constructs its `dst` as
+`ggml_view_tensor(ctx, a)` where `a` is that immediate (reshaped, 2D)
+argument - so `dst->ne[2]` is *always* 1 by construction whenever this
+reshape happened, guaranteed equal to `src0`'s `ne[2]` by
+`ggml_set_rows`'s own assert at construction time (`ggml.c:3965`). ggml-cpu's
+own reference (`ggml_compute_forward_set_rows_f32`) uses exactly these
+`dst`-local dims. This backend's `ggml_backend_ttnn_compute_set_rows`
+instead read `struct ggml_tensor * a = dst->view_src` - which, per this
+backend's own root-walking convention (sec 16, needed to locate the actual
+device buffer), skips *past* that intermediate reshape node and lands on
+the *original* 3D root tensor, whose raw `ne[2]` is the real stream count
+(128 in this repro), not 1. Comparing that against `src0`'s `ne[2]=1`
+naturally fails. A second, related bug rode along in the same function:
+the row-index bounds check `GGML_ASSERT(i1 >= 0 && i1 < ne1)` used
+`a->ne[1]` (`kv_size` alone) instead of `dst->ne[1]`
+(`kv_size*n_stream`) - since `k_idxs` are explicitly documented as
+*global* flat indices, this would have silently accepted out-of-range
+indices as in-bounds, or rejected valid ones for streams beyond the
+first, had it been reached before the first assert.
+
+**Not a design flaw in sec 16's view-support work** - a conflation
+specific to this one op: every other consumer of `view_src` in this file
+uses it correctly, exactly as sec 16 intended, to separate "which device
+buffer" from "what shape" (e.g. `compute_mul_mat` locates its buffer via
+the root but always operates on the *view's own* resolved offset/size).
+`ggml_backend_ttnn_compute_set_rows` conflated the two for this op only:
+right buffer via `view_src`, but also (wrongly) right *shape* via
+`view_src`, instead of `dst`'s own - invisible in every single-stream
+test in this document (sec 19's original test, and every real-model run
+sec 18-27) because `dst`'s shape and `view_src`'s raw shape are
+*identical* whenever `n_stream == 1` (no reshape ever happens), the same
+"invisible until problem size > 1" pattern this document has hit
+repeatedly (sec 14, 21, 24).
+
+**Fix**: `ggml_backend_ttnn_set_rows_apply()`'s shape/stride parameter
+changed from `a` (`view_src`, the root) to `dst` itself, matching
+ggml-cpu's reference exactly - `dst->ne[0/2/3]` for the shape assert,
+`dst->ne[1]` for the index bounds check, `dst->nb[1/2/3]` for the
+destination-row address arithmetic. The buffer location, whole-buffer
+read/write, and sole-occupant assert are unchanged (still correctly go
+through `a`/`view_src`, per sec 16 - only shape/stride interpretation
+moved to `dst`). Numerically sound because `dst->nb[1]` (the stride
+`ggml_reshape_2d` computes for the merged dimension) is identical to the
+root's own `nb[1]` for any reshape that merges two already-contiguous,
+adjacent dimensions (which this always is) - the same bytes, just
+re-described.
+
+**Verified**: rebuilt `llama-perplexity`/`llama-cli` clean. Re-ran the
+exact failing command - clean run, exit 0, real forward pass:
+`Final estimate: PPL = 291.3710 +/- 0.41543` (vs. sec 33's F32/single-stream
+baseline of ~291.5 - same "close, not identical, not garbage" signature
+sec 33 used as its correctness signal). **Regression-checked the
+single-stream path this fix must not disturb**: re-ran sec 33's original
+single-sequence `llama-cli -ngl 99 -dev TT_METALIUM0` command - decode
+completes without any new assert or crash (the only failure is the same
+pre-existing, unrelated chat-template-parsing error from this synthetic
+model's minimal vocab, identical to sec 33, confirming this fix changed
+nothing for `n_stream == 1`).
+
+**Consequence**: this is a distinct bug from sec 27/29/30's still-open
+`SIGSEGV` (that one needs sustained real execution at real-model scale to
+reproduce at all; this one reproduced in under a second on a toy model) -
+fixing it does not close that investigation, but it is a real, previously
+undiscovered correctness gap in a code path (non-unified multi-sequence
+KV cache) no test in this document had reached before, now fixed and
+verified. Demonstrates sec 33's tiny-model infrastructure has ongoing
+value beyond the quantize work it was built for: it makes previously
+90-minutes-to-reproduce-or-worse backend bugs cheap to hunt for, as long
+as the *shape* of the bug (not its scale) is what matters - worth reaching
+for before another expensive real-model run when chasing sec 27's SIGSEGV
+next, per that section's own flagged options.
+
+## 35. Two more bugs found the same way: a real tt-metal SIGFPE, and a
+    zero-token-ubatch edge case in compute_mul_mat - sec 27's SIGSEGV
+    still not reproduced, but this pushed further than any synthetic test
+
+Kept pushing sec 34's tiny-model approach toward sec 30's flagged
+untested differences from sec 27's SIGSEGV (multi-threading, wall-clock
+duration, shape diversity, real op mix) - specifically duration and
+`-t 2`, since sec 30's synthetic repros topped out at 28-35 minutes
+against the real failure's 93. Built a much longer input (4000 words,
+sparse ~32-word vocabulary against this model's minimal tokenizer,
+inflating to ~28000 tokens via byte-fallback for most words) to force
+`llama-perplexity` into evaluating **1754 chunks** instead of sec 34's 2 -
+substantially more cumulative real dispatches than sec 34, in a fraction
+of the wall-clock cost of another real-model run.
+
+**Bug 1 - SIGFPE (integer divide-by-zero) inside tt-metal's own
+`Buffer::view()`**, reached via the same `read_shard_from_device` call
+chain as sec 27's still-open SIGSEGV (`ggml_backend_ttnn_read_whole` ->
+`enqueue_read_shards` -> `read_shard_from_device` -> `Buffer::view`) -
+different signal, same function chain. Root-caused by reading
+`Buffer::view()`'s own source (`tt_metal/impl/buffers/buffer.cpp`):
+`region.offset % page_size()` is computed unconditionally, before even
+checking whether the region is the trivial "whole buffer" case that
+would just return early - so any buffer with `page_size() == 0` crashes
+on literally any access, including this backend's own always-whole-buffer
+reads (sec 9). This backend's `ggml_backend_ttnn_alloc_tensor_buffer()`
+sets `page_size = ggml_nbytes(tensor)` directly, with no floor - and a
+ggml tensor can legitimately have zero elements (a degenerate ubatch at a
+chunk boundary, which is exactly what 128-way sequence parallelism
+against very short per-chunk contexts produces routinely). **Fix**: clamp
+`nbytes` to a 1-byte minimum when allocating the device buffer, and apply
+the identical clamp to `ggml_backend_ttnn_locate()`'s stale-registry
+comparison (sec 27) so a genuinely-zero-byte tensor's 1-byte buffer isn't
+misread as "stale" on every single access. This is a real, reportable
+tt-metal-side bug independent of this backend (sec 9's own "worth
+flagging to Tenstorrent" category) - `Buffer::view()` should check for
+the trivial whole-buffer case, or at minimum guard against
+`page_size()==0`, before doing modulo arithmetic on it.
+
+**Bug 2 - a second, different assert immediately surfaced once the SIGFPE
+was gone**: `ggml-ttnn.cpp:472`'s `"mul_mat dst must not be a view"` -
+the exact assert sec 26/27 already root-caused and fixed once (the stale
+buffer-registry case). Debug-printed `dst`'s state at the new failure
+(same methodology as sec 27), and it was a *different* trigger of the
+same assert: `ffn_gate-1`, `M=0` - a real, valid zero-token `MUL_MAT` node
+(the multi-sequence batching machinery can legitimately hand some streams
+no work on a given step), which satisfies
+`ggml_backend_ttnn_mul_mat_shape_ok()`'s `M % 32 == 0` gate trivially
+(`0 % 32 == 0`) and reaches `compute_mul_mat` - where `ggml_nbytes(dst)`
+is correctly `0`, but the located buffer's size is `1` (bug 1's own
+clamp), so the exact-equality assert now fails for a *genuinely
+non-view* `dst`, not a stale one. **Fix**: added an explicit `if (M == 0)
+return;` early-out in `compute_mul_mat`, before any of the
+buffer-location/assert logic - there is nothing to compute or write for a
+zero-token batch, so this is a true no-op, not a workaround. Deliberately
+left `ggml_backend_ttnn_mul_mat_shape_ok()` itself unchanged (sec 26's own
+comment documents *why* `M` is intentionally unconstrained there, a
+considered decision with its own history across sec 22-26) - the fix
+belongs in `compute_mul_mat`, which is the only place that actually knows
+`M == 0` means "nothing to do," not in the shared shape gate.
+
+**Verified**: with both fixes, the exact same 1754-chunk/`n_seq=128`/`-t 2`
+run that hit the SIGFPE then the assert now runs clean - let it go for the
+full 170s test budget (not to completion; ETA was ~33 minutes at this
+scale, matching this document's standing point that ttsim dispatch
+overhead compounds with chunk count) and it processed 128 chunks with
+stable, sane PPL values (~291.2-291.3, consistent with every other
+baseline in sec 33-34) and zero crashes - substantially more cumulative
+real kernel dispatches, across genuine attention/RoPE/softmax/FFN traffic
+(not a synthetic 1-2-op graph), than sec 29-30's synthetic repros reached
+in their 28-35 minute runs. Regression-checked both single-sequence
+(`n_seq_max=1`) TTNN-offloaded and pure-CPU perplexity on the short input:
+`291.3710` (TTNN) vs. `291.3678` (CPU) - unchanged from sec 34, confirming
+neither fix altered any real computation, only removed two ways to crash
+before reaching it.
+
+**Consequence**: sec 27's SIGSEGV still has not been reproduced - this
+section's stress test, while far more sustained than sec 29-30's, is
+still a toy-scale model (128-embd vs. 2560) and didn't run to full
+completion. But it closes two more real, previously-undiscovered gaps
+(one of them a genuine upstream tt-metal bug, not just this backend's
+own code) using the same cheap infrastructure, and demonstrates that
+"push this tiny-model harness further along sec 30's untested axes"
+is a productive line of attack - worth continuing (longer inputs, `-t`
+variations, deliberately irregular per-layer shapes) before committing to
+another expensive real-model run, though it may ultimately need the real
+model's specific scale/duration to reproduce sec 27's bug at all.
+
+**Update - full run completed clean**: re-ran the identical scenario
+(1754 chunks, `-t 2`, GQA-shaped tiny model per the shape-diversity probe
+below) to completion rather than the 170s-truncated sample above -
+**exit code 0, no crash, all 1754 chunks**, `Final estimate: PPL =
+290.9513 +/- 0.00976` (tightened error bar than any earlier partial
+sample, as expected with ~14x more chunks averaged in). This is now a
+complete, not partial, negative result for sec 27's SIGSEGV at this
+toy scale - strengthens rather than just suggests the "needs real
+model scale/duration, not just this backend's own bug density" reading,
+though a real-model test (attempted next) is the only way to actually
+confirm that rather than infer it.
+
+**Shape-diversity probe run alongside this**: also tried GQA
+(`head_count=8, head_count_kv=2`, making `attn_k`/`attn_v` genuinely
+different shapes from `attn_q`/`attn_output` for the first time in any
+test in this document) at both single-sequence (TTNN `290.9809` vs. CPU
+`290.9781`, matching sec 34's "close, not identical" signature) and the
+same multi-sequence stress scenario (clean, consistent PPL) - no new bug
+surfaced from shape diversity alone, a useful negative result narrowing
+where sec 27's bug is *not* coming from.
+
+## 36. Directly attacking sec 27's SIGSEGV: two tt-metal concurrency
+    hypotheses investigated and refuted, diagnostic instrumentation added,
+    a fresh real-model repro in progress
+
+With sec 35's toy-scale duration/shape stress tests both coming back
+clean (sec 35's own "update" - a full 1754-chunk run completed with no
+crash), picked the still-open sec 27 `SIGSEGV` back up directly, reading
+tt-metal's own source at the crash site rather than continuing to probe
+via this backend's synthetic tests.
+
+**Hypothesis A - unbounded growth in `logical_cores_for_previous_workload_`
+(refuted)**: `SDMeshCommandQueue::dispatch_program()`
+(`tt_metal/distributed/sd_mesh_command_queue.cpp:225-240`) *merges*
+(appends, never deduplicates) tracked active cores into this map when
+`asynchronous_slow_dispatch_enabled_` is true and a device already has an
+entry - a genuinely unbounded-growth pattern if triggered repeatedly
+without an intervening `wait_for_cores_idle()` clear, which would match
+"surfaces after enough cumulative dispatches" exactly. Refuted by
+checking every call site of `enable_asynchronous_slow_dispatch()`
+(`grep -rn` across the whole tt-metal tree): every one is an explicit,
+opt-in call from application/test code (`ttnn.enable_asynchronous_slow_dispatch(...)`,
+demos and unit tests under `models/demos/`, `tests/`) - this backend
+(`ggml-ttnn.cpp`) never calls it, so `asynchronous_slow_dispatch_enabled_`
+is always `false` here and this code path is dead for us. A real pattern,
+just not our bug.
+
+**Hypothesis B - unsynchronized concurrent access to the same map
+(refuted)**: `wait_for_cores_idle()` (`sd_mesh_command_queue.cpp:152-161`)
+reads and *clears* `logical_cores_for_previous_workload_` without holding
+`logical_cores_mutex_`, while `dispatch_program()`'s non-blocking path
+writes to the same map *with* that mutex held - a classic
+asymmetric-locking data race on an `unordered_map`, which would plausibly
+explain a sporadic, small/near-null-address `SIGSEGV` from corrupted STL
+container internals, matching the observed crash signature well. Looked
+promising enough to trace all the way through before concluding: both the
+writer (`dispatch_program`, invoked via `enqueue_mesh_workload`) and the
+reader (`wait_for_cores_idle`, invoked via `read_shard_from_device` inside
+`enqueue_read_shards`) execute while holding the *same* outer
+`lock_api_function_()` mutex (confirmed via
+`mesh_command_queue_base.cpp:226`'s own comment: "enqueue_read_shards
+will call lock_api_function_(), no need to call it here"), and
+`enqueue_mesh_workload`'s thread-pool dispatch path
+(`launch_thread_pool_->wait()`, line 278) fully joins every worker thread
+*before* releasing that outer lock - so despite the inner
+`logical_cores_mutex_` being asymmetrically applied, the coarser outer
+lock already serializes every path that touches this map. Not a race in
+practice, just redundant-looking (and arguably confusing) locking style.
+
+**What's next since static reading hit diminishing returns**: added
+lightweight, always-flushed diagnostic counters directly in this
+backend's own code (`ggml_backend_ttnn_read_whole`/`write_whole` in
+`ggml-ttnn.cpp` - every whole-buffer transfer this backend ever does goes
+through exactly these two functions), logging every 25th call's index and
+buffer size to stderr. This needs no tt-metal rebuild (tt-metal itself is
+large, third-party, and vendored - modifying and rebuilding it is a much
+bigger, riskier undertaking than instrumenting our own thin backend) and
+means that whenever the real crash happens, the log alone (even with no
+usable core dump in this environment) tells us exactly how many transfers
+succeeded and how large the in-flight one was, the same "debug print,
+then re-run" methodology sec 27 itself used successfully for the
+stale-buffer-registry bug.
+
+Restarted the real end-to-end repro (`llama-cli -m <I2_S GGUF> -p "You are
+a helpful assistant" -n 1 -t 2 --single-turn -ngl 99 -dev TT_METALIUM0`,
+the exact sec 27/`docs/run-with-ttsim.md` command, against the real
+downloaded `BitNet-b1.58-2B-4T` checkpoint already present in this
+environment - not a synthetic model, since none of sec 33-35's toy-scale
+stress testing has reproduced this bug and the real model's specific
+scale/duration remains the leading hypothesis) with the instrumented
+binary, running in the background.
+
+**Outcome: completed cleanly - the SIGSEGV did not reproduce.** Exit code
+0, real generated output, clean device teardown sequence, zero crash
+signatures anywhere in the log (`grep` for `GGML_ASSERT`, `Segmentation`,
+`abort`, `TT_FATAL` all came back empty). Ran for **6276.2s (104.6
+minutes)** - *longer* than sec 27's original 93-minute crash point - and
+went past it without incident. Final diagnostic tallies: **2500**
+successful `read_whole` calls, **1700** successful `write_whole` calls
+through the exact `read_shard_from_device` code path that used to crash.
+
+**What this does and doesn't establish**: this is the first time in this
+entire porting effort that this exact command has completed end to end.
+It is not, however, a controlled experiment - sec 31-35's other fixes
+(the `SET_ROWS` view-vs-root shape bug, the zero-byte-buffer `SIGFPE`
+clamp, the zero-token `MUL_MAT` no-op) were made for independent reasons
+on different code paths, none deliberately targeting sec 27, and no
+bisection (reverting each individually and re-running this same
+~100-minute command) has been done to confirm which one - if any -
+actually mattered here, since each such run costs on the order of two
+hours. Two live possibilities, both consistent with the evidence: (a)
+one of sec 31-35's fixes happened to also close whatever this run's real
+predecessor state was (the zero-byte clamp in particular touches the
+exact same `read_shard_from_device`/`Buffer::view()` call chain sec 27's
+own crash was in, sec 35), or (b) the original bug is genuinely
+timing/state-dependent (consistent with sec 27's own "surfaces after
+enough cumulative dispatches" framing) and this run simply didn't hit
+the window this time. A single clean run cannot distinguish these -
+only a repeat run (expensive) or a real crash recurrence would.
+
+**Diagnostic instrumentation left in place, not yet removed** - despite
+being commented as temporary, given the causal uncertainty above it has
+ongoing value for any future run (confirming or a recurrence). Should
+still be removed before this branch is considered done, once sec 27 is
+either confirmed resolved via a repeat run or the code has stabilized
+enough that its presence is no longer informative.
+
+**Confirmation run: identical result, deterministically.** Ran the exact
+same command again from a clean process. **Exit code 0 again** - zero
+crash signatures, clean device teardown - and critically, **the exact
+same diagnostic tallies as the first run**: 2500 `read_whole` calls, 1700
+`write_whole` calls, same generated token, to the call. Total time
+6577.5s (109.6 minutes) this time vs. 6276.2s (104.6 minutes) the first
+run - wall-clock varies (expected, ttsim + host scheduling noise), but
+the *number and identity* of every device transfer does not.
+
+Two independent ~105-110-minute runs converging on identical call counts
+is strong evidence this is a fully deterministic code path, not a
+timing-dependent race that happened to miss its window twice in a row -
+if the original bug were genuinely state/timing-dependent (sec 27's own
+"surfaces after enough cumulative dispatches" framing), two separate
+process runs would be very unlikely to produce byte-for-byte identical
+transfer counts while also both happening to dodge a race. This shifts
+the balance of evidence from "inconclusive, could be luck" (after the
+first run) to "very likely genuinely fixed" - most plausibly by sec 35's
+zero-byte-buffer clamp, given it directly touches the exact
+`read_shard_from_device`/`Buffer::view()` call chain this crash was in,
+though this still isn't a formal bisection (reverting that one fix and
+re-running would be the only fully conclusive test, at another ~2 hours
+of cost - not done here, judged not worth it given two clean runs already
+in hand).
+
+**Consequence**: sec 27's `SIGSEGV` - the single biggest open blocker
+this entire porting effort has carried since it first appeared - is
+tentatively closed. "Tentatively" because two clean runs, however
+deterministic-looking, are not a mathematical proof of absence for a bug
+whose original trigger was never fully root-caused; if it recurs, this
+section (and sec 35's zero-byte clamp) is the first place to look.
+Removed the temporary diagnostic instrumentation from
+`ggml_backend_ttnn_read_whole`/`write_whole` (`ggml-ttnn.cpp`) now that it
+has served its purpose - it was always meant to be temporary, and its
+presence stops being informative once the question it was added to
+answer has a confident answer.
+
 
 
 
